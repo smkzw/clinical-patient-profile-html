@@ -1,63 +1,155 @@
 from __future__ import annotations
 
 import csv
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+import openpyxl
 
-PROJECT_ROOT = Path("/Users/smkzw/Documents/康哲项目资料/Ruxolitinib-AD/CFDI Inspection/准备阶段")
-SCRIPT_PATH = PROJECT_ROOT / "skills" / "clinical-patient-profile-html" / "scripts" / "build_patient_profile_html.py"
-LISTING_XLSX = PROJECT_ROOT / "RUX-03-002_列表_数据集_Excel_20250612_处理后_南方医科大学皮肤病医院_杭州市第一人民医院.xlsx"
-FINDING_XLSX = PROJECT_ROOT / "自查稽查问题汇总-260511.xlsx"
-PD_DEF_XLSX = PROJECT_ROOT / "附录2：RUX-03-002_方案偏离分类界定表_V1.0_20240528_clean.xlsx"
-SUBJECT_REPORT_XLS = PROJECT_ROOT / "RUX-03-002_受试者报表_20250613.xls"
-CENTERS = "南方医科大学皮肤病医院；杭州市第一人民医院"
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "build_patient_profile_html.py"
+
+
+def create_listing_workbook(path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "SUBJ--受试者页"
+    ws.append(["研究中心", "中心编号", "受试者", "受试者状态"])
+    ws.append(["", "", "", ""])
+    ws.append(["示例中心医院", "01", "S01001", "完成试验"])
+
+    ws = wb.create_sheet("DM--人口统计学")
+    ws.append(["研究中心", "受试者", "年龄（系统生成）", "性别"])
+    ws.append(["", "", "", ""])
+    ws.append(["示例中心医院", "S01001", 28, "女性"])
+
+    ws = wb.create_sheet("RAND--入组随机页")
+    ws.append(["研究中心", "受试者", "入组日期", "随机日期和时间（系统生成）", "受试者是否入组本研究？", "是否进行PK血样采集？", "未入组原因", "其他原因，请说明"])
+    ws.append(["", "", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "2026-01-02", "2026-01-02", "是", "否", "", ""])
+
+    ws = wb.create_sheet("IC--知情同意")
+    ws.append(["研究中心", "受试者", "首次签署知情同意书日期"])
+    ws.append(["", "", ""])
+    ws.append(["示例中心医院", "S01001", "2026-01-01"])
+
+    ws = wb.create_sheet("SV--访视日期")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "访视日期", "计划最早访视日期（系统生成）", "计划最晚访视日期（系统生成）"])
+    ws.append(["", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "SCR", "筛选期", "2026-01-01", "2026-01-01", "2026-01-01"])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", "2026-01-02", "2026-01-02"])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", "2026-01-15", "2026-01-17"])
+
+    ws = wb.create_sheet("AE--不良事件")
+    ws.append(["研究中心", "受试者", "是否发生不良事件？", "是否为严重不良事件（SAE）？", "不良事件名称", "最早开始日期", "最严重程度（CTCAE V5.0）", "与研究用药的关系", "转归", "结束日期"])
+    ws.append(["", "", "", "", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "否", "否", "", "", "", "", "", ""])
+
+    ws = wb.create_sheet("VS--生命体征")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "是否进行生命体征检查？", "检查日期", "临床意义评价", "异常有临床意义，请说明", "体温", "体温_UNIT", "脉搏", "脉搏_UNIT", "收缩压", "收缩压_UNIT", "舒张压", "舒张压_UNIT"])
+    ws.append(["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "是", "2026-01-02", "正常", "", 36.7, "°C", 72, "次/分", 118, "mmHg", 76, "mmHg"])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "是", "2026-01-16", "正常", "", 36.8, "°C", 70, "次/分", 120, "mmHg", 78, "mmHg"])
+
+    ws = wb.create_sheet("EASI--湿疹面积及严重程度指数评分（EASI）")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "评估日期", "EASI得分（4个部位的评分总和）"])
+    ws.append(["", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", 18])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", 9])
+
+    ws = wb.create_sheet("IGA--研究者整体评分（IGA）")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "评估日期", "IGA得分"])
+    ws.append(["", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", "3分-中度"])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", "1分-几乎清除"])
+
+    ws = wb.create_sheet("NRS--瘙痒数值评定量表（Itch NRS）-平均值")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "评估日期", "平均瘙痒程度"])
+    ws.append(["", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", 7])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", 3])
+
+    ws = wb.create_sheet("LBHEMA--实验室检查-血常规")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "采样日期", "检查项目", "检查结果", "单位", "下限", "上限", "标准值", "临床意义评价", "异常有临床意义，请说明", "正常值范围标记"])
+    ws.append(["", "", "", "", "", "", "", "", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", "白细胞计数", 6.2, "10^9/L", 3.5, 9.5, "3.5-9.5", "正常", "", "正常"])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", "白细胞计数", 5.8, "10^9/L", 3.5, 9.5, "3.5-9.5", "正常", "", "正常"])
+
+    wb.save(path)
+
+
+def create_finding_workbook(path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "示例中心-自查问题汇总"
+    ws.append(["序号", "中心", "受试者编号", "发现日期", "分类", "一类分级", "访视", "自查问题描述", "问题状态（关闭/未关闭/无法整改，解释）", "PM审核后回复", "研究者确认回复", "自查问题整改措施"])
+    ws.append([1, "示例中心医院", "S01001", "2026-01-20", "疗效评价", "低", "D15", "量表原始记录需复核。", "已整改", "已核对", "中心已确认", "补充原始记录索引"])
+    wb.save(path)
+
+
+def create_pd_definition_workbook(path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "方案偏离分类"
+    ws.append(["分类", "说明"])
+    ws.append(["一般偏离", "示例"])
+    wb.save(path)
 
 
 class BuildPatientProfileHtmlTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="patient-profile-skill-", dir="/private/tmp"))
+        self.temp_root = Path(tempfile.mkdtemp(prefix="patient-profile-skill-", dir="/private/tmp"))
+        self.project_dir = self.temp_root / "project"
+        self.output_dir = self.temp_root / "output"
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        create_listing_workbook(self.project_dir / "demo_listing.xlsx")
+        create_finding_workbook(self.project_dir / "demo_finding.xlsx")
+        create_pd_definition_workbook(self.project_dir / "demo_pd_definition.xlsx")
 
     def tearDown(self) -> None:
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        shutil.rmtree(self.temp_root, ignore_errors=True)
 
     def run_builder(self, *extra_args: str) -> None:
         cmd = [
             "python3",
             str(SCRIPT_PATH),
             "--work-dir",
-            str(PROJECT_ROOT),
+            str(self.project_dir),
             "--listing-xlsx",
-            str(LISTING_XLSX),
+            str(self.project_dir / "demo_listing.xlsx"),
             "--finding-xlsx",
-            str(FINDING_XLSX),
+            str(self.project_dir / "demo_finding.xlsx"),
             "--pd-def-xlsx",
-            str(PD_DEF_XLSX),
-            "--subject-report-xls",
-            str(SUBJECT_REPORT_XLS),
+            str(self.project_dir / "demo_pd_definition.xlsx"),
             "--centers",
-            CENTERS,
+            "示例中心医院",
             "--output-dir",
-            str(self.temp_dir),
+            str(self.output_dir),
             *extra_args,
         ]
         subprocess.run(cmd, check=True)
 
     def count_rows(self, file_name: str) -> int:
-        with (self.temp_dir / file_name).open(encoding="utf-8-sig", newline="") as handle:
+        return self.count_rows_from_dir(self.output_dir, file_name)
+
+    @staticmethod
+    def count_rows_from_dir(directory: Path, file_name: str) -> int:
+        with (directory / file_name).open(encoding="utf-8-sig", newline="") as handle:
             return max(sum(1 for _ in csv.reader(handle)) - 1, 0)
 
     def test_precheck_only_writes_reports(self) -> None:
         self.run_builder("--precheck-only")
-        self.assertTrue((self.temp_dir / "input_precheck.md").exists())
-        self.assertTrue((self.temp_dir / "input_precheck.json").exists())
-        self.assertTrue((self.temp_dir / "suggested_project_config.json").exists())
-        precheck = (self.temp_dir / "input_precheck.md").read_text(encoding="utf-8")
+        self.assertTrue((self.output_dir / "input_precheck.md").exists())
+        self.assertTrue((self.output_dir / "input_precheck.json").exists())
+        self.assertTrue((self.output_dir / "suggested_project_config.json").exists())
+        precheck = (self.output_dir / "input_precheck.md").read_text(encoding="utf-8")
         self.assertIn("可继续构建：是", precheck)
-        self.assertIn("南方医科大学皮肤病医院；杭州市第一人民医院", precheck)
+        self.assertIn("示例中心医院", precheck)
 
     def test_full_build_writes_expected_outputs(self) -> None:
         self.run_builder()
@@ -69,31 +161,30 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
             "vital_signs_longitudinal_dataset.csv",
             "finding_subject_level_dataset.csv",
         ]:
-            self.assertTrue((self.temp_dir / name).exists(), name)
+            self.assertTrue((self.output_dir / name).exists(), name)
         self.assertGreater(self.count_rows("cleaned_subject_profile_dataset.csv"), 0)
         self.assertGreater(self.count_rows("efficacy_longitudinal_dataset.csv"), 0)
         self.assertGreater(self.count_rows("lab_longitudinal_dataset.csv"), 0)
-        html = (self.temp_dir / "patient_profile.html").read_text(encoding="utf-8")
-        self.assertIn("南方医科大学皮肤病医院", html)
-        self.assertIn("杭州市第一人民医院", html)
+        html = (self.output_dir / "patient_profile.html").read_text(encoding="utf-8")
+        self.assertIn("示例中心医院", html)
+        self.assertIn("受试者Patient Profile", html)
+        self.assertIn("疗效数据模块", html)
 
     def test_build_with_generated_config(self) -> None:
         self.run_builder("--precheck-only")
-        config_path = self.temp_dir / "suggested_project_config.json"
-        second_dir = self.temp_dir / "from-config"
+        config_path = self.output_dir / "suggested_project_config.json"
+        second_dir = self.temp_root / "from-config"
         cmd = [
             "python3",
             str(SCRIPT_PATH),
             "--work-dir",
-            str(PROJECT_ROOT),
+            str(self.project_dir),
             "--listing-xlsx",
-            str(LISTING_XLSX),
+            str(self.project_dir / "demo_listing.xlsx"),
             "--finding-xlsx",
-            str(FINDING_XLSX),
+            str(self.project_dir / "demo_finding.xlsx"),
             "--pd-def-xlsx",
-            str(PD_DEF_XLSX),
-            "--subject-report-xls",
-            str(SUBJECT_REPORT_XLS),
+            str(self.project_dir / "demo_pd_definition.xlsx"),
             "--config-json",
             str(config_path),
             "--output-dir",
@@ -103,9 +194,27 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertTrue((second_dir / "patient_profile.html").exists())
         self.assertGreater(self.count_rows_from_dir(second_dir, "efficacy_longitudinal_dataset.csv"), 0)
 
-    def count_rows_from_dir(self, directory: Path, file_name: str) -> int:
-        with (directory / file_name).open(encoding="utf-8-sig", newline="") as handle:
-            return max(sum(1 for _ in csv.reader(handle)) - 1, 0)
+
+@unittest.skipUnless(os.environ.get("PATIENT_PROFILE_REAL_FIXTURE_DIR"), "Optional regression test requires PATIENT_PROFILE_REAL_FIXTURE_DIR")
+class BuildPatientProfileHtmlRegressionTest(unittest.TestCase):
+    def test_real_fixture_precheck(self) -> None:
+        fixture_dir = Path(os.environ["PATIENT_PROFILE_REAL_FIXTURE_DIR"]).resolve()
+        output_dir = Path(tempfile.mkdtemp(prefix="patient-profile-regression-", dir="/private/tmp"))
+        try:
+            cmd = [
+                "python3",
+                str(SCRIPT_PATH),
+                "--work-dir",
+                str(fixture_dir),
+                "--output-dir",
+                str(output_dir),
+                "--precheck-only",
+            ]
+            subprocess.run(cmd, check=True)
+            self.assertTrue((output_dir / "input_precheck.md").exists())
+            self.assertTrue((output_dir / "suggested_project_config.json").exists())
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
