@@ -35,10 +35,12 @@ TARGET_CENTERS: list[str] = []
 PROTOCOL_FILES: list[Path] = []
 FINDING_SHEET_SPECS: list[dict[str, str]] = []
 PROTOCOL_SUMMARY: dict[str, Any] = {"files": [], "endpoint_items": [], "selected_metrics": [], "response_rules": [], "visit_mentions": []}
+STUDY_PHASES: list[str] = []
+SUBJECT_SCOPE = ""
+INCLUDE_USV = ""
 MISSING_TEXT = "未在现有文件中确认"
 
 REQUIRED_LISTING_SHEETS = [
-    "SUBJ",
     "DM",
     "RAND",
     "IC",
@@ -55,20 +57,21 @@ FILE_PATTERNS = {
     "reference_html": [r"subject_timeline.*\.html", r"patient_profile.*\.html"],
 }
 
-SUBJECT_ID_RE = re.compile(r"S\d{5}")
+SUBJECT_ID_RE = re.compile(r"(?:S)?\d{5}")
 
 CORE_SHEET_CATALOG = {
-    "SV": {"required": True, "patterns": [r"^SV--", r"访视日期"]},
-    "SUBJ": {"required": True, "patterns": [r"^SUBJ--", r"受试者页"]},
-    "DM": {"required": True, "patterns": [r"^DM--", r"人口统计"]},
-    "RAND": {"required": True, "patterns": [r"^RAND--", r"入组随机", r"随机页"]},
-    "IC": {"required": True, "patterns": [r"^IC--", r"知情同意"]},
+    "SV": {"required": True, "patterns": [r"^SV(?:--.*)?$", r"访视日期"]},
+    "SUBJ": {"required": False, "patterns": [r"^SUBJ(?:--.*)?$", r"受试者页"]},
+    "DM": {"required": True, "patterns": [r"^DM(?:--.*)?$", r"人口统计"]},
+    "RAND": {"required": True, "patterns": [r"^RAND(?:--.*)?$", r"^RAN$", r"入组随机", r"随机页"]},
+    "IC": {"required": True, "patterns": [r"^IC(?:--.*)?$", r"^ICF$", r"知情同意"]},
     "DSEOT": {"required": False, "patterns": [r"^DSEOT--", r"治疗结束"]},
     "DSEOS": {"required": False, "patterns": [r"^DSEOS--", r"研究结束"]},
-    "AE": {"required": True, "patterns": [r"^AE--", r"不良事件"]},
-    "PC": {"required": False, "patterns": [r"^PC--", r"药代", r"PK"]},
-    "EG": {"required": False, "patterns": [r"^EG--", r"心电图", r"12导联"]},
-    "VS": {"required": True, "patterns": [r"^VS--", r"生命体征"]},
+    "DS": {"required": False, "patterns": [r"^DS$", r"完成试验", r"提前退出"]},
+    "AE": {"required": True, "patterns": [r"^AE(?:--.*)?$", r"不良事件"]},
+    "PC": {"required": False, "patterns": [r"^PC(?:--.*)?$", r"药代", r"PK"]},
+    "EG": {"required": False, "patterns": [r"^EG(?:--.*)?$", r"心电图", r"12导联"]},
+    "VS": {"required": True, "patterns": [r"^VS(?:--.*)?$", r"生命体征"]},
 }
 
 
@@ -84,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-json", help="Optional project config JSON generated from a previous precheck.")
     parser.add_argument("--output-dir", help="Directory for generated CSV/HTML outputs.")
     parser.add_argument("--centers", help="Semicolon-separated centers to include. Default: auto-detect all centers in listing.")
+    parser.add_argument("--subject-scope", choices=["all", "randomized"], help="Include all subjects or randomized subjects only.")
+    parser.add_argument("--include-usv", choices=["yes", "no"], help="Whether to include unplanned/USV data at subject level.")
     parser.add_argument("--precheck-only", action="store_true", help="Only scan inputs and write a precheck report.")
     return parser.parse_args()
 
@@ -138,6 +143,91 @@ def choose_candidate_column(headers: list[str], candidates: list[str]) -> str:
     return ""
 
 
+def normalize_header_key(value: Any) -> str:
+    return re.sub(r"[\s_\-（）()]+", "", clean_text(value)).lower()
+
+
+def find_matching_header(headers: list[str], candidates: list[str]) -> str:
+    exact = choose_candidate_column(headers, candidates)
+    if exact:
+        return exact
+    normalized = {normalize_header_key(header): header for header in headers if clean_text(header)}
+    for candidate in candidates:
+        candidate_key = normalize_header_key(candidate)
+        for header_key, header in normalized.items():
+            if candidate_key and (candidate_key in header_key or header_key in candidate_key):
+                return header
+    return ""
+
+
+def get_row_value(row: dict[str, Any], candidates: list[str]) -> Any:
+    headers = list(row.keys())
+    header = find_matching_header(headers, candidates)
+    if header:
+        return row.get(header)
+    for candidate in candidates:
+        for key, value in row.items():
+            key_text = clean_text(key)
+            if candidate in key_text or key_text in candidate:
+                return value
+    return ""
+
+
+def extract_center_from_row(row: dict[str, Any]) -> str:
+    return standardize_center_name(
+        get_row_value(row, ["研究中心", "试验中心名称", "中心名称", "中心", "SITE"])
+    )
+
+
+def extract_subject_from_row(row: dict[str, Any]) -> str:
+    return extract_subject_id(
+        get_row_value(row, ["受试者", "受试者编号", "USUBJID", "SUBJID", "Subject ID"]),
+        row.get("受试者"),
+        row.get("受试者编号"),
+    )
+
+
+def extract_data_section(row: dict[str, Any]) -> str:
+    return clean_text(get_row_value(row, ["数据节", "访视名称", "访视", "VISIT"]))
+
+
+def parse_phase_visit_label(label: Any) -> dict[str, str]:
+    text = clean_text(label)
+    if not text:
+        return {"phase": "", "visit_name": "", "visit_id": ""}
+    phase = text.split("V", 1)[0].strip() if "V" in text and "（" in text else text
+    visit_id = ""
+    visit_name = text
+    match = re.search(r"V\d+\s*[（(]([^）)]+)[）)]", text)
+    if match:
+        visit_id = clean_text(match.group(1))
+    else:
+        match = re.search(r"\b(D-?\d+(?:~D-?\d+)?(?:±\d+d)?|W\d+)\b", text, re.I)
+        if match:
+            visit_id = clean_text(match.group(1))
+    if "筛选" in text and not visit_id:
+        visit_id = "SCR"
+    if "筛选" in text and visit_id.startswith("D-"):
+        visit_id = "SCR"
+    visit_id = visit_id.replace("±", "±").replace(" ", "")
+    if "共同页" in text:
+        visit_id = "COMMON"
+    return {"phase": phase or text, "visit_name": visit_name, "visit_id": visit_id or text}
+
+
+def phase_visit_sort_key(visit_id: str, date_text: str) -> tuple[int, int, str]:
+    visit = clean_text(visit_id)
+    if visit == "SCR":
+        return (0, -7, visit)
+    match = re.search(r"D(-?\d+)", visit)
+    if match:
+        return (1, int(match.group(1)), visit)
+    match = re.search(r"W(\d+)", visit, re.I)
+    if match:
+        return (2, int(match.group(1)) * 7, visit)
+    return (9, 9999, clean_text(date_text) or visit)
+
+
 def detect_sheet_aliases(path: Path) -> dict[str, str]:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -157,23 +247,31 @@ def detect_efficacy_config(path: Path) -> list[dict[str, Any]]:
     finally:
         wb.close()
     configs: list[dict[str, Any]] = []
-    for spec in DEFAULT_EFFICACY_CONFIG:
-        sheet_name = choose_best_sheet(sheet_names, spec.get("sheet_patterns", []))
-        if not sheet_name:
-            continue
-        sheet = read_listing_sheet(path, sheet_name)
-        headers = sheet["headers"]
-        chosen_value_col = choose_candidate_column(headers, spec.get("value_candidates", [spec["value_col"]]))
-        chosen_date_col = choose_candidate_column(headers, spec.get("date_candidates", [spec["date_col"]]))
-        value_col = chosen_value_col or spec["value_col"]
-        date_col = chosen_date_col or spec["date_col"]
-        resolved = deepcopy(spec)
-        resolved["sheet"] = sheet_name
-        resolved["value_col"] = value_col
-        resolved["date_col"] = date_col
-        resolved["value_col_confirmed"] = bool(chosen_value_col)
-        resolved["date_col_confirmed"] = bool(chosen_date_col)
-        configs.append(resolved)
+    for rule in GENERIC_EFFICACY_RULES:
+        matched_sheets = [name for name in sheet_names if score_sheet_name(name, rule.get("sheet_patterns", [])) > 0]
+        for sheet_name in matched_sheets:
+            sheet = read_listing_sheet(path, sheet_name)
+            headers = sheet["headers"]
+            chosen_value_col = find_matching_header(headers, rule.get("value_candidates", []))
+            if not chosen_value_col:
+                continue
+            chosen_date_col = find_matching_header(headers, rule.get("date_candidates", []))
+            resolved = {
+                "sheet": sheet_name,
+                "sheet_patterns": rule.get("sheet_patterns", []),
+                "metric": rule["metric"],
+                "group": rule.get("group", "疗效"),
+                "value_col": chosen_value_col or (rule.get("value_candidates") or [""])[0],
+                "date_col": chosen_date_col or (rule.get("date_candidates") or [""])[0],
+                "value_col_confirmed": bool(chosen_value_col),
+                "date_col_confirmed": bool(chosen_date_col),
+                "aggregate": rule.get("aggregate", "visit"),
+                "default_variable_type": rule.get("default_variable_type", "continuous"),
+                "aliases": rule.get("aliases", []),
+                "value_parser": rule.get("value_parser", "float"),
+            }
+            if not any(item["sheet"] == sheet_name and item["metric"] == rule["metric"] for item in configs):
+                configs.append(resolved)
     return configs
 
 
@@ -264,44 +362,58 @@ def metric_matches_protocol(metric: str, line: str) -> bool:
     metric_upper = metric.upper()
     if metric_upper and metric_upper in text.upper():
         return True
-    metric_alias_map = {
-        "EASI": ["湿疹面积及严重程度指数"],
-        "IGA": ["研究者整体评分", "vIGA-AD"],
-        "BSA": ["受累体表面积"],
-        "SCORAD": ["特应性皮炎评分"],
-        "DLQI": ["皮肤病生活质量指数"],
-        "CDLQI": ["儿童皮肤病生活质量指数"],
-        "NRS": ["Itch NRS", "瘙痒数值评定量表", "Pruritus NRS"],
-        "QSI-PROMIS睡眠相关影响8a": ["PROMIS", "睡眠相关影响8a"],
-        "QSI-PROMIS睡眠困扰8b": ["PROMIS", "睡眠困扰8b"],
-    }
-    return any(alias.lower() in text.lower() for alias in metric_alias_map.get(metric, []))
+    aliases = next((item.get("aliases", []) for item in ENDPOINT_METRIC_CATALOG if item["metric"] == metric), [])
+    return any(clean_text(alias).lower() in text.lower() for alias in aliases if clean_text(alias))
 
 
 def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_efficacy: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = {"files": [str(path) for path in protocol_files], "endpoint_items": [], "selected_metrics": [], "response_rules": [], "visit_mentions": []}
+    summary = {
+        "files": [str(path) for path in protocol_files],
+        "endpoint_items": [],
+        "selected_metrics": [],
+        "response_rules": [],
+        "visit_mentions": [],
+        "study_phases": [],
+        "required_assessments": [],
+    }
     if not protocol_files:
         return summary
 
     lines: list[str] = []
+    phase_set: set[str] = set()
+    assessment_set: set[str] = set()
+    detected_metric_names = {item["metric"] for item in detected_efficacy}
     for path in protocol_files:
         text = read_protocol_file(path)
         if not text:
             continue
         lines.extend(line.strip() for line in text.splitlines() if clean_text(line))
-        summary["visit_mentions"].extend(sorted(set(re.findall(r"\b(?:D\d+|W\d+|Week\s*\d+|筛选期|基线|治疗结束)\b", text, flags=re.I))))
+        summary["visit_mentions"].extend(sorted(set(re.findall(r"\b(?:D-?\d+(?:~D-?\d+)?(?:±\d+d)?|W\d+|Week\s*\d+|筛选期|基线|治疗结束|安全性随访期)\b", text, flags=re.I))))
+        for match in re.finditer(r"((?:筛选/?导入期|双盲治疗期|开放(?:标签)?治疗期|安全性随访期|随访期|治疗结束期))", text):
+            phase_set.add(clean_text(match.group(1)))
+        if any(token in text for token in ["实验室", "血常规", "血生化", "尿常规"]):
+            assessment_set.add("实验室")
+        if "生命体征" in text:
+            assessment_set.add("生命体征")
+        if any(token in text for token in ["心电图", "QTc", "QTcF"]):
+            assessment_set.add("心电图")
 
     detected_metrics: dict[str, dict[str, Any]] = {}
     response_rules: dict[str, dict[str, Any]] = {}
     for line in lines:
-        if not any(keyword in line for keyword in ["终点", "endpoint", "研究流程", "访视", "评估", "疗效"]):
-            continue
         endpoint_role = classify_endpoint_role(line)
-        for item in detected_efficacy:
+        line_has_visit = bool(re.search(r"\b(?:D-?\d+(?:~D-?\d+)?|W\d+|V\d+)\b", line, re.I))
+        line_has_flow = any(keyword in line for keyword in ["研究流程", "流程表", "访视", "评估时间表", "检查项目"])
+        if endpoint_role == "未分类" and not line_has_visit and not line_has_flow:
+            continue
+        for item in ENDPOINT_METRIC_CATALOG:
             metric = item["metric"]
             if not metric_matches_protocol(metric, line):
                 continue
+            if metric not in detected_metric_names:
+                continue
             variable_type = classify_variable_type(line)
+            assessment_set.add("疗效")
             existing = detected_metrics.get(metric)
             if existing is None or existing["endpoint_role"] == "未分类":
                 detected_metrics[metric] = {
@@ -331,6 +443,11 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
 
     summary["selected_metrics"] = sorted(detected_metrics.values(), key=lambda item: efficacy_sort_key(item["metric"]))
     summary["response_rules"] = sorted(response_rules.values(), key=lambda item: (efficacy_sort_key(item["metric"]), item["label"]))
+    summary["visit_mentions"] = sorted(unique(summary["visit_mentions"]))
+    if "安全性随访期" in phase_set and "随访期" in phase_set:
+        phase_set.discard("随访期")
+    summary["study_phases"] = sorted(phase_set)
+    summary["required_assessments"] = sorted(assessment_set)
     return summary
 
 
@@ -339,8 +456,11 @@ def build_suggested_project_config() -> dict[str, Any]:
         "project_name": WORK.name,
         "html_title": "受试者Patient Profile",
         "target_centers": TARGET_CENTERS[:],
+        "subject_scope": SUBJECT_SCOPE,
+        "include_usv": INCLUDE_USV,
         "sheet_aliases": SHEET_ALIASES.copy(),
         "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
+        "study_phases": STUDY_PHASES[:],
         "efficacy_config": deepcopy(EFFICACY_CONFIG),
         "lab_config": deepcopy(LAB_CONFIG),
         "finding_sheet_specs": deepcopy(FINDING_SHEET_SPECS),
@@ -350,13 +470,19 @@ def build_suggested_project_config() -> dict[str, Any]:
 
 
 def apply_project_config(config: dict[str, Any]) -> None:
-    global TARGET_CENTERS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, FINDING_SHEET_SPECS, HTML_TITLE, PROTOCOL_SUMMARY
+    global TARGET_CENTERS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, FINDING_SHEET_SPECS, HTML_TITLE, PROTOCOL_SUMMARY, STUDY_PHASES, SUBJECT_SCOPE, INCLUDE_USV
     if config.get("target_centers"):
         TARGET_CENTERS = [clean_text(item) for item in config.get("target_centers", []) if clean_text(item)]
+    if config.get("subject_scope"):
+        SUBJECT_SCOPE = clean_text(config.get("subject_scope"))
+    if config.get("include_usv"):
+        INCLUDE_USV = clean_text(config.get("include_usv"))
     if config.get("sheet_aliases"):
         SHEET_ALIASES = {alias: clean_text(name) for alias, name in config["sheet_aliases"].items()}
     if config.get("protocol_summary"):
         PROTOCOL_SUMMARY = deepcopy(config["protocol_summary"])
+    if config.get("study_phases"):
+        STUDY_PHASES = [clean_text(item) for item in config["study_phases"] if clean_text(item)]
     if config.get("efficacy_config"):
         EFFICACY_CONFIG = deepcopy(config["efficacy_config"])
     if config.get("lab_config"):
@@ -371,7 +497,7 @@ def infer_centers_from_listing(path: Path) -> list[str]:
     if not path.exists():
         return []
     aliases = detect_sheet_aliases(path)
-    for alias in ["SUBJ", "SV", "DM"]:
+    for alias in ["SUBJ", "SV", "DM", "RAND", "IC"]:
         sheet_name = aliases.get(alias, "")
         if not sheet_name:
             continue
@@ -381,9 +507,9 @@ def infer_centers_from_listing(path: Path) -> list[str]:
             continue
         centers = sorted(
             {
-                standardize_center_name(row.get("研究中心") or row.get("中心名称") or row.get("中心"))
+                extract_center_from_row(row)
                 for row in sheet["records"]
-                if clean_text(row.get("研究中心") or row.get("中心名称") or row.get("中心"))
+                if extract_center_from_row(row)
             }
         )
         if centers:
@@ -429,7 +555,7 @@ def detect_finding_sheet_specs(path: Path, candidate_centers: list[str]) -> list
 
 def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
     global WORK, OUTPUT_DIR, LISTING_XLSX, FINDING_XLSX, PD_DEF_XLSX, SUBJECT_REPORT_XLS, REF_HTMLS
-    global TARGET_CENTERS, PROTOCOL_FILES, FINDING_SHEET_SPECS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, HTML_TITLE, PROTOCOL_SUMMARY
+    global TARGET_CENTERS, PROTOCOL_FILES, FINDING_SHEET_SPECS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, HTML_TITLE, PROTOCOL_SUMMARY, STUDY_PHASES, SUBJECT_SCOPE, INCLUDE_USV
 
     WORK = Path(args.work_dir).resolve()
     OUTPUT_DIR = Path(args.output_dir).resolve() if args.output_dir else (WORK / "patient_profile_output")
@@ -451,9 +577,12 @@ def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
     SHEET_ALIASES = detect_sheet_aliases(LISTING_XLSX) if LISTING_XLSX.exists() else {alias: "" for alias in CORE_SHEET_CATALOG}
     detected_efficacy = detect_efficacy_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
     PROTOCOL_SUMMARY = detect_protocol_endpoint_summary(PROTOCOL_FILES, detected_efficacy)
+    STUDY_PHASES = PROTOCOL_SUMMARY.get("study_phases", [])[:]
     EFFICACY_CONFIG = select_efficacy_config_by_protocol(detected_efficacy, PROTOCOL_SUMMARY)
     LAB_CONFIG = detect_lab_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
     HTML_TITLE = "受试者Patient Profile"
+    SUBJECT_SCOPE = clean_text(args.subject_scope)
+    INCLUDE_USV = clean_text(args.include_usv)
 
     if args.centers:
         TARGET_CENTERS = [clean_text(item) for item in re.split(r"[;；]", args.centers) if clean_text(item)]
@@ -477,8 +606,11 @@ def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
         "finding_sheet_specs": FINDING_SHEET_SPECS[:],
         "sheet_aliases": SHEET_ALIASES.copy(),
         "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
+        "study_phases": STUDY_PHASES[:],
         "efficacy_config": deepcopy(EFFICACY_CONFIG),
         "lab_config": deepcopy(LAB_CONFIG),
+        "subject_scope": SUBJECT_SCOPE,
+        "include_usv": INCLUDE_USV,
         "output_dir": str(OUTPUT_DIR),
     }
 
@@ -655,6 +787,150 @@ DEFAULT_EFFICACY_CONFIG = [
     },
 ]
 
+GENERIC_EFFICACY_RULES = [
+    {
+        "metric": "EASI",
+        "aliases": ["EASI", "湿疹面积及严重程度指数"],
+        "sheet_patterns": [r"\bEASI\b", r"湿疹面积及严重程度指数"],
+        "value_candidates": ["EASI得分（4个部位的评分总和）", "EASI得分", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "疗效",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "IGA",
+        "aliases": ["IGA", "研究者整体评分"],
+        "sheet_patterns": [r"\bIGA\b", r"研究者整体评分"],
+        "value_candidates": ["IGA得分", "结果值", "评分"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "疗效",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+        "value_parser": "iga",
+    },
+    {
+        "metric": "BSA",
+        "aliases": ["BSA", "受累体表面积"],
+        "sheet_patterns": [r"\bBSA\b", r"受累体表面积"],
+        "value_candidates": ["BSA结果（4个部位的评分总和）", "BSA结果", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "疗效",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "SCORAD",
+        "aliases": ["SCORAD", "特应性皮炎评分"],
+        "sheet_patterns": [r"SCORAD", r"最后分值"],
+        "value_candidates": ["最后分值", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "疗效",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "DLQI",
+        "aliases": ["DLQI", "皮肤病生活质量指数"],
+        "sheet_patterns": [r"\bDLQI\b", r"皮肤病生活质量指数"],
+        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "CDLQI",
+        "aliases": ["CDLQI", "儿童皮肤病生活质量指数"],
+        "sheet_patterns": [r"\bCDLQI\b", r"儿童皮肤病生活质量指数"],
+        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "NRS",
+        "aliases": ["NRS", "Itch NRS", "瘙痒数值评定量表"],
+        "sheet_patterns": [r"Itch NRS", r"\bNRS\b", r"瘙痒数值评定量表"],
+        "value_candidates": ["平均瘙痒程度", "平均值", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "QSI-PROMIS睡眠相关影响8a",
+        "aliases": ["PROMIS 8a", "睡眠相关影响8a", "QSI"],
+        "sheet_patterns": [r"PROMIS.*8a", r"睡眠相关影响8a"],
+        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "QSI-PROMIS睡眠困扰8b",
+        "aliases": ["PROMIS 8b", "睡眠困扰8b", "QSD"],
+        "sheet_patterns": [r"PROMIS.*8b", r"睡眠困扰8b"],
+        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
+        "date_candidates": ["评估日期", "日期", "访视日期"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "rTNSS",
+        "aliases": ["rTNSS", "反射性鼻部总症状评分", "鼻部总症状评分"],
+        "sheet_patterns": [r"^RES\d*$", r"^RES\d+$", r"^RES[0-9_]+$"],
+        "value_candidates": ["rTNSS总分(RTNSSNUM)", "rTNSS总分", "RTNSSNUM"],
+        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
+        "group": "疗效",
+        "aggregate": "visit_date",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "iTNSS",
+        "aliases": ["iTNSS", "瞬时鼻部总症状评分"],
+        "sheet_patterns": [r"^RES_?\d+$", r"^RES_1$", r"^RES_2$", r"^RES_[0-9]+$"],
+        "value_candidates": ["iTNSS总分(ITNSSNUM)", "iTNSS总分", "ITNSSNUM"],
+        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
+        "group": "疗效",
+        "aggregate": "visit_date",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "rTOSS",
+        "aliases": ["rTOSS", "反射性眼部总症状评分"],
+        "sheet_patterns": [r"^RES\d*$", r"^RES\d+$", r"^RES[0-9_]+$"],
+        "value_candidates": ["rTOSS总分(RTOSSNUM)", "rTOSS总分", "RTOSSNUM"],
+        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
+        "group": "疗效",
+        "aggregate": "visit_date",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "iTOSS",
+        "aliases": ["iTOSS", "瞬时眼部总症状评分"],
+        "sheet_patterns": [r"^RES_?\d+$", r"^RES_1$", r"^RES_2$", r"^RES_[0-9]+$"],
+        "value_candidates": ["iTOSS总分(ITOSSNUM)", "iTOSS总分", "ITOSSNUM"],
+        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
+        "group": "疗效",
+        "aggregate": "visit_date",
+        "default_variable_type": "continuous",
+    },
+    {
+        "metric": "RQLQ(s)",
+        "aliases": ["RQLQ", "RQLQ(s)", "生活质量问卷", "鼻结膜炎生活质量问卷"],
+        "sheet_patterns": [r"\bRQL\b", r"RQLQ"],
+        "value_candidates": ["总分(SCTNUM)", "总分", "SCTNUM"],
+        "date_candidates": ["评估日期(RQLDAT)", "评估日期", "RQLDAT"],
+        "group": "PRO",
+        "aggregate": "visit",
+        "default_variable_type": "continuous",
+    },
+]
+
 RESPONSE_RULE_CATALOG = [
     {
         "rule_key": "EASI75",
@@ -710,17 +986,17 @@ RESPONSE_RULE_CATALOG = [
 ENDPOINT_METRIC_CATALOG = [
     {
         "metric": spec["metric"],
-        "aliases": [spec["metric"], *spec.get("sheet_patterns", [])],
-        "default_variable_type": "continuous",
+        "aliases": spec.get("aliases", [spec["metric"]]),
+        "default_variable_type": spec.get("default_variable_type", "continuous"),
         "config": spec,
     }
-    for spec in DEFAULT_EFFICACY_CONFIG
+    for spec in GENERIC_EFFICACY_RULES
 ]
 
 DEFAULT_LAB_CONFIG = [
-    {"sheet": "LBHEMA--实验室检查-血常规", "sheet_patterns": [r"^LBHEMA--", r"血常规"], "lab_category": "血常规"},
-    {"sheet": "LBCHEM--实验室检查-血生化", "sheet_patterns": [r"^LBCHEM--", r"血生化"], "lab_category": "血生化"},
-    {"sheet": "LBURIN--实验室检查-尿常规", "sheet_patterns": [r"^LBURIN--", r"尿常规"], "lab_category": "尿常规"},
+    {"sheet": "LBHEMA--实验室检查-血常规", "sheet_patterns": [r"^LBHEMA--", r"^LB_HEM$", r"血常规"], "lab_category": "血常规"},
+    {"sheet": "LBCHEM--实验室检查-血生化", "sheet_patterns": [r"^LBCHEM--", r"^LB_CHEM$", r"血生化"], "lab_category": "血生化"},
+    {"sheet": "LBURIN--实验室检查-尿常规", "sheet_patterns": [r"^LBURIN--", r"^LB_URI$", r"尿常规"], "lab_category": "尿常规"},
 ]
 
 EFFICACY_CONFIG = deepcopy(DEFAULT_EFFICACY_CONFIG)
@@ -1487,9 +1763,16 @@ def read_sheet_matrix(path: Path, sheet_name: str, max_rows: int | None = None) 
 def read_listing_sheet(path: Path, sheet_name: str) -> dict[str, Any]:
     rows = read_sheet_matrix(path, sheet_name)
     headers = make_unique_headers([clean_text(v) for v in (rows[0] if rows else [])])
-    code_headers = make_unique_headers([clean_text(v) for v in (rows[1] if len(rows) > 1 else [])])
+    second_row = rows[1] if len(rows) > 1 else []
+    second_nonempty = [clean_text(v) for v in second_row if clean_text(v)]
+    second_is_code_header = False
+    if second_nonempty:
+        code_like = sum(1 for item in second_nonempty if re.fullmatch(r"[A-Za-z0-9_]+", item))
+        second_is_code_header = code_like >= max(3, len(second_nonempty) * 0.6)
+    code_headers = make_unique_headers([clean_text(v) for v in second_row]) if second_is_code_header else []
     records: list[dict[str, Any]] = []
-    for raw_row in rows[2:]:
+    data_start = 2 if second_is_code_header else 1
+    for raw_row in rows[data_start:]:
         if not any(v not in (None, "") for v in raw_row):
             continue
         row = {headers[idx]: raw_row[idx] if idx < len(raw_row) else "" for idx in range(len(headers))}
@@ -1537,31 +1820,70 @@ def read_generic_sheet(path: Path, sheet_name: str) -> dict[str, Any]:
 def load_subject_report_index() -> dict[str, dict[str, str]]:
     if not SUBJECT_REPORT_XLS.exists():
         return {}
-    book = xlrd.open_workbook(str(SUBJECT_REPORT_XLS), formatting_info=False)
-    sheet = book.sheet_by_index(0)
-    headers = [clean_text(v) for v in sheet.row_values(4)]
     index: dict[str, dict[str, str]] = {}
-    for row_idx in range(5, sheet.nrows):
-        values = sheet.row_values(row_idx)
-        if not values:
-            continue
-        subject = clean_text(values[0])
-        if not SUBJECT_ID_RE.fullmatch(subject):
-            continue
-        row = {headers[i]: clean_text(values[i]) if i < len(values) else "" for i in range(len(headers))}
-        center = standardize_center_name(row.get("中心名称"))
-        if center not in TARGET_CENTERS:
-            continue
-        index[subject] = {
-            "中心": center,
-            "性别": row.get("性别", ""),
-            "年龄组": infer_age_group_from_report(row.get("分层(IGA、年龄)")),
-            "随机组别": normalize_study_group(row.get("研究分组")),
-            "随机时间": row.get("随机时间", ""),
-            "随机号": row.get("随机号", ""),
-            "受试者状态_报表": row.get("受试者状态", ""),
-        }
-    return index
+    if SUBJECT_REPORT_XLS.suffix.lower() == ".xls":
+        book = xlrd.open_workbook(str(SUBJECT_REPORT_XLS), formatting_info=False)
+        sheet = book.sheet_by_index(0)
+        header_row = 0
+        for row_idx in range(min(sheet.nrows, 8)):
+            joined = " | ".join(clean_text(v) for v in sheet.row_values(row_idx))
+            if any(token in joined for token in ["受试者编号", "中心名称", "治疗组", "研究分组"]):
+                header_row = row_idx
+                break
+        headers = [clean_text(v) for v in sheet.row_values(header_row)]
+        for row_idx in range(header_row + 1, sheet.nrows):
+            values = sheet.row_values(row_idx)
+            if not values:
+                continue
+            row = {headers[i]: clean_text(values[i]) if i < len(values) else "" for i in range(len(headers))}
+            subject = extract_subject_id(row.get("受试者编号"), row.get("受试者"))
+            if not subject:
+                continue
+            center = standardize_center_name(row.get("中心名称"))
+            if TARGET_CENTERS and center and center not in TARGET_CENTERS:
+                continue
+            index[subject] = {
+                "中心": center,
+                "性别": row.get("性别", ""),
+                "年龄组": infer_age_group_from_report(row.get("分层(IGA、年龄)") or row.get("年龄组")),
+                "随机组别": normalize_study_group(row.get("研究分组") or row.get("治疗组")),
+                "随机时间": row.get("随机时间", ""),
+                "随机号": row.get("随机号", ""),
+                "受试者状态_报表": row.get("受试者状态", ""),
+            }
+        return index
+
+    wb = openpyxl.load_workbook(SUBJECT_REPORT_XLS, read_only=True, data_only=True)
+    try:
+        sheet = wb[wb.sheetnames[0]]
+        rows = list(sheet.iter_rows(values_only=True))
+        header_row = 0
+        for idx, raw in enumerate(rows[:8]):
+            joined = " | ".join(clean_text(v) for v in raw)
+            if any(token in joined for token in ["受试者编号", "中心名称", "治疗组", "研究分组"]):
+                header_row = idx
+                break
+        headers = [clean_text(v) for v in rows[header_row]]
+        for raw in rows[header_row + 1 :]:
+            row = {headers[i]: clean_text(raw[i]) if i < len(raw) else "" for i in range(len(headers))}
+            subject = extract_subject_id(row.get("受试者编号"), row.get("受试者"))
+            if not subject:
+                continue
+            center = standardize_center_name(row.get("中心名称"))
+            if TARGET_CENTERS and center and center not in TARGET_CENTERS:
+                continue
+            index[subject] = {
+                "中心": center,
+                "性别": row.get("性别", ""),
+                "年龄组": infer_age_group_from_report(row.get("分层(IGA、年龄)") or row.get("年龄组")),
+                "随机组别": normalize_study_group(row.get("研究分组") or row.get("治疗组")),
+                "随机时间": row.get("随机时间", ""),
+                "随机号": row.get("随机号", ""),
+                "受试者状态_报表": row.get("受试者状态", ""),
+            }
+        return index
+    finally:
+        wb.close()
 
 
 def scan_workbook_structure(path: Path, listing_mode: bool) -> list[dict[str, Any]]:
@@ -1606,6 +1928,13 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
                 issues.append({"级别": "需确认", "项目": "疗效字段映射", "说明": f"{item['metric']} 的日期列未能自动确认，当前拟用 {item['date_col']}。", "建议": "请确认日期列名，或允许仅按访视顺序展示。"})
             if item.get("variable_type") == "需确认":
                 issues.append({"级别": "需确认", "项目": "疗效变量类型", "说明": f"{item['metric']} 在方案终点描述中未能判断为连续型还是二分类。", "建议": "请确认该指标的变量类型及展示方式。"})
+        required_assessments = set(runtime.get("protocol_summary", {}).get("required_assessments", []))
+        if "实验室" in required_assessments and not runtime.get("lab_config"):
+            issues.append({"级别": "阻断", "项目": "实验室检查", "说明": "方案/研究流程提示需收集实验室检查，但listing中未识别到可用实验室sheet。", "建议": "请指出实验室数据位于哪个listing的哪个sheet。"})
+        if "生命体征" in required_assessments and not runtime.get("sheet_aliases", {}).get("VS"):
+            issues.append({"级别": "阻断", "项目": "生命体征", "说明": "方案/研究流程提示需收集生命体征，但listing中未识别到生命体征sheet。", "建议": "请指出生命体征位于哪个listing的哪个sheet。"})
+        if "心电图" in required_assessments and not runtime.get("sheet_aliases", {}).get("EG"):
+            issues.append({"级别": "阻断", "项目": "心电图", "说明": "方案/研究流程提示需收集心电图，但listing中未识别到心电图sheet。", "建议": "请指出心电图位于哪个listing的哪个sheet。"})
 
     if not FINDING_XLSX.exists():
         issues.append({"级别": "阻断", "项目": "Finding台账", "说明": "未识别到Finding台账文件，无法生成固定展示模块。", "建议": "请提供自查/稽查/Finding台账。"})
@@ -1632,6 +1961,21 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
     elif not runtime.get("protocol_summary", {}).get("selected_metrics"):
         issues.append({"级别": "阻断", "项目": "方案终点解析", "说明": "已读取方案文件，但未从主次要终点或研究流程中识别出明确疗效指标。", "建议": "请确认方案文件内容可读，或手工指定需纳入的疗效指标。"})
 
+    if runtime.get("subject_scope") not in {"all", "randomized"}:
+        issues.append({
+            "级别": "需确认",
+            "项目": "受试者纳入范围",
+            "说明": "尚未确认纳入全部受试者，还是仅纳入已随机受试者。",
+            "建议": "请明确选择：1）全部受试者；2）仅纳入已随机受试者。若纳入全部受试者，中心层面的筛选期数据可能与CSR统计不完全一致。",
+        })
+    if runtime.get("include_usv") not in {"yes", "no"}:
+        issues.append({
+            "级别": "需确认",
+            "项目": "USV数据纳入",
+            "说明": "尚未确认是否纳入计划外访视/USV数据。",
+            "建议": "请明确选择是否纳入USV。若纳入，仅在个例层面展示，并按USV实际日期放入历时图表。",
+        })
+
     if not TARGET_CENTERS:
         issues.append({"级别": "阻断", "项目": "中心范围", "说明": "无法从主listing自动识别中心。", "建议": "请手动提供目标中心列表。"})
     elif len(TARGET_CENTERS) > 1 and not runtime.get("centers_from_user"):
@@ -1648,7 +1992,7 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
         "suggested_config": suggested_config,
         "issues": issues,
         "questions": questions,
-        "ready_to_build": not any(issue["级别"] == "阻断" for issue in issues),
+        "ready_to_build": not any(issue["级别"] in {"阻断", "需确认"} for issue in issues),
     }
 
 
@@ -1728,64 +2072,74 @@ def build_visit_index() -> dict[tuple[str, str], dict[str, str]]:
     sheet = read_listing_alias("SV")
     visit_index: dict[tuple[str, str], dict[str, str]] = {}
     for row in sheet["records"]:
-        center = standardize_center_name(row.get("研究中心"))
-        subject = clean_text(row.get("受试者"))
+        center = extract_center_from_row(row)
+        subject = extract_subject_from_row(row)
         if center not in TARGET_CENTERS or not subject:
             continue
-        visit = clean_text(row.get("访视OID"))
+        parsed = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视名称", "访视", "VISIT"]))
+        visit = parsed["visit_id"]
+        visit_date = parse_date(get_row_value(row, ["访视日期(VISDAT)", "访视日期", "VISDAT"]))
+        existing = visit_index.get((subject, visit), {})
+        if existing.get("访视日期") and visit_date and existing["访视日期"] <= visit_date:
+            continue
         visit_index[(subject, visit)] = {
-            "访视名称": clean_text(row.get("访视名称")),
-            "访视编号": visit,
-            "访视日期": parse_date(row.get("访视日期")),
-            "计划最早访视日期": parse_date(row.get("计划最早访视日期（系统生成）")),
-            "计划最晚访视日期": parse_date(row.get("计划最晚访视日期（系统生成）")),
+            "研究分期": parsed["phase"],
+            "访视名称": parsed["visit_name"] or extract_data_section(row) or MISSING_TEXT,
+            "访视编号": visit or MISSING_TEXT,
+            "访视日期": visit_date,
+            "计划最早访视日期": parse_date(get_row_value(row, ["计划最早访视日期（系统生成）", "计划最早访视日期"])),
+            "计划最晚访视日期": parse_date(get_row_value(row, ["计划最晚访视日期（系统生成）", "计划最晚访视日期"])),
         }
     return visit_index
 
 
 def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, Any]]:
-    subj_sheet = read_listing_alias("SUBJ")
+    subj_sheet = read_listing_alias("SUBJ", optional=True)
     dm_sheet = read_listing_alias("DM")
     rand_sheet = read_listing_alias("RAND")
     ic_sheet = read_listing_alias("IC")
     dseot_sheet = read_listing_alias("DSEOT", optional=True)
     dseos_sheet = read_listing_alias("DSEOS", optional=True)
+    ds_sheet = read_listing_alias("DS", optional=True)
     ae_sheet = read_listing_alias("AE")
     pc_sheet = read_listing_alias("PC", optional=True)
     visit_index = build_visit_index()
     subject_report_index = load_subject_report_index()
 
-    dm_map = {clean_text(r.get("受试者")): r for r in dm_sheet["records"] if clean_text(r.get("受试者"))}
-    rand_map = {clean_text(r.get("受试者")): r for r in rand_sheet["records"] if clean_text(r.get("受试者"))}
-    ic_map = {clean_text(r.get("受试者")): r for r in ic_sheet["records"] if clean_text(r.get("受试者"))}
-    dseot_map = {clean_text(r.get("受试者")): r for r in dseot_sheet["records"] if clean_text(r.get("受试者"))}
-    dseos_map = {clean_text(r.get("受试者")): r for r in dseos_sheet["records"] if clean_text(r.get("受试者"))}
+    dm_map = {extract_subject_from_row(r): r for r in dm_sheet["records"] if extract_subject_from_row(r)}
+    rand_map = {extract_subject_from_row(r): r for r in rand_sheet["records"] if extract_subject_from_row(r)}
+    ic_map = {extract_subject_from_row(r): r for r in ic_sheet["records"] if extract_subject_from_row(r)}
+    dseot_map = {extract_subject_from_row(r): r for r in dseot_sheet["records"] if extract_subject_from_row(r)}
+    dseos_map = {extract_subject_from_row(r): r for r in dseos_sheet["records"] if extract_subject_from_row(r)}
+    ds_map = {extract_subject_from_row(r): r for r in ds_sheet["records"] if extract_subject_from_row(r)}
 
     ae_flags = defaultdict(lambda: {"ae": False, "sae": False})
     for row in ae_sheet["records"]:
-        subject = clean_text(row.get("受试者"))
+        subject = extract_subject_from_row(row)
         if not subject:
             continue
-        if clean_text(row.get("是否发生不良事件？")) == "是":
+        if clean_text(get_row_value(row, ["是否发生不良事件？", "是否发生不良事件"])) == "是":
             ae_flags[subject]["ae"] = True
-        if clean_text(row.get("是否为严重不良事件（SAE）？")) == "是":
+        if clean_text(get_row_value(row, ["是否为严重不良事件（SAE）？", "是否为严重不良事件"])) == "是":
             ae_flags[subject]["sae"] = True
 
     pk_flags = defaultdict(bool)
     for row in pc_sheet["records"]:
-        subject = clean_text(row.get("受试者"))
-        if clean_text(row.get("是否进行药代动力学（PK）血样采集？")) == "是":
+        subject = extract_subject_from_row(row)
+        if clean_text(get_row_value(row, ["是否进行药代动力学（PK）血样采集？", "是否进行PK血样采集？", "是否进行PK血样采集"])) == "是":
             pk_flags[subject] = True
 
-    visit_presence = defaultdict(set)
+    visit_presence = defaultdict(list)
+    phase_names = STUDY_PHASES[:] or sorted({meta.get("研究分期", "") for meta in visit_index.values() if meta.get("研究分期")})
     for (subject, visit), meta in visit_index.items():
         if meta.get("访视日期"):
-            visit_presence[subject].add(visit)
+            visit_presence[subject].append(meta)
 
     profiles: list[dict[str, Any]] = []
-    for row in subj_sheet["records"]:
-        center = standardize_center_name(row.get("研究中心"))
-        subject = clean_text(row.get("受试者"))
+    base_records = subj_sheet["records"] if subj_sheet["records"] else dm_sheet["records"]
+    for row in base_records:
+        center = extract_center_from_row(row)
+        subject = extract_subject_from_row(row)
         if center not in TARGET_CENTERS or not subject:
             continue
         dm = dm_map.get(subject, {})
@@ -1793,50 +2147,59 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
         ic = ic_map.get(subject, {})
         dseot = dseot_map.get(subject, {})
         dseos = dseos_map.get(subject, {})
+        ds = ds_map.get(subject, {})
         report_row = subject_report_index.get(subject, {})
 
-        age = clean_text(dm.get("年龄（系统生成）"))
+        randomized = clean_text(get_row_value(rand, ["是否筛选成功并随机(RANYN)", "受试者是否入组本研究？", "是否筛选成功并随机", "是否入组本研究"])) == "是"
+        if SUBJECT_SCOPE == "randomized" and not randomized:
+            continue
+
+        age = clean_text(get_row_value(dm, ["年龄（系统生成）", "年龄(AGE)", "年龄"]))
         age_group = MISSING_TEXT
         age_num = to_float(age)
         if age_num is not None:
             age_group = "青少年" if age_num < 18 else "成人"
-        if report_row.get("年龄组"):
+        if report_row.get("年龄组") and report_row.get("年龄组") != MISSING_TEXT:
             age_group = report_row["年龄组"]
 
-        stage = clean_text(dseot.get("治疗结束阶段"))
-        completed_blind = "是" if "D57" in visit_presence[subject] else MISSING_TEXT
-        completed_open = "是" if stage == "开放治疗期" else MISSING_TEXT
-        completed_study = "是" if clean_text(row.get("受试者状态")) == "完成试验" else "否"
-        screen_fail_reason = clean_text(rand.get("未入组原因")) or clean_text(rand.get("其他原因，请说明")) or MISSING_TEXT
-        blind_enter = parse_date(rand.get("入组日期")) or parse_date(rand.get("随机日期和时间（系统生成）")) or MISSING_TEXT
-        blind_complete = visit_index.get((subject, "D57"), {}).get("访视日期", MISSING_TEXT)
-        open_enter = visit_index.get((subject, "D85"), {}).get("访视日期", MISSING_TEXT)
-        open_complete = parse_date(dseot.get("末次给药日期")) if stage == "开放治疗期" else MISSING_TEXT
+        raw_status = clean_text(get_row_value(row, ["受试者状态(STATUS)", "受试者状态"])) or report_row.get("受试者状态_报表", "")
+        if not randomized:
+            subject_status = "筛选失败"
+        elif clean_text(get_row_value(ds, ["是否完成试验(DSYN)", "是否完成试验"])) == "是":
+            subject_status = "完成试验"
+        elif clean_text(get_row_value(ds, ["提前退出原因(DSDECOD)", "提前退出原因"])) or clean_text(get_row_value(dseos, ["研究结束原因", "提前退出原因"])) :
+            subject_status = "提前退出"
+        else:
+            subject_status = raw_status or "在研"
+        completed_study = "是" if subject_status == "完成试验" else "否"
+        screen_fail_reason = clean_text(get_row_value(rand, ["否，请说明原因(RANREAS)", "未入组原因", "否，请说明原因", "其他未随机原因，请说明(RANREASO)", "其他原因，请说明"])) or MISSING_TEXT
+        screen_date = next((meta["访视日期"] for meta in sorted(visit_presence.get(subject, []), key=lambda item: phase_visit_sort_key(item.get("访视编号", ""), item.get("访视日期", ""))) if "筛选" in clean_text(meta.get("研究分期")) or clean_text(meta.get("访视编号")) == "SCR"), "")
+        baseline_date = parse_date(get_row_value(rand, ["随机日期(RANDAT)", "入组日期", "随机日期和时间（系统生成）"])) or visit_index.get((subject, "D1"), {}).get("访视日期", "")
+        phase_fields: dict[str, str] = {}
+        for phase_name in phase_names:
+            observed = [meta for meta in visit_presence.get(subject, []) if clean_text(meta.get("研究分期")) == clean_text(phase_name)]
+            observed.sort(key=lambda item: phase_visit_sort_key(item.get("访视编号", ""), item.get("访视日期", "")))
+            phase_fields[f"{phase_name}进入日期"] = observed[0]["访视日期"] if observed else MISSING_TEXT
+            phase_fields[f"{phase_name}完成日期"] = observed[-1]["访视日期"] if observed else MISSING_TEXT
 
         profiles.append(
             {
                 "中心": center,
-                "中心编号": clean_text(row.get("中心编号")) or MISSING_TEXT,
+                "中心编号": clean_text(get_row_value(row, ["中心编号", "试验中心编号"])) or MISSING_TEXT,
                 "受试者编号": subject,
                 "受试者键": f"{center}|{subject}",
-                "受试者状态": clean_text(row.get("受试者状态")) or MISSING_TEXT,
+                "受试者状态": subject_status or MISSING_TEXT,
                 "年龄": age or MISSING_TEXT,
                 "年龄组": age_group,
-                "性别": report_row.get("性别") or clean_text(dm.get("性别")) or MISSING_TEXT,
+                "性别": report_row.get("性别") or clean_text(get_row_value(dm, ["性别(SEX)", "性别"])) or MISSING_TEXT,
                 "随机组别": report_row.get("随机组别") or reference_groups.get(subject, MISSING_TEXT),
-                "筛选日期": visit_index.get((subject, "SCR"), {}).get("访视日期", MISSING_TEXT),
-                "知情同意日期": parse_date(ic.get("首次签署知情同意书日期")) or MISSING_TEXT,
-                "基线/随机日期": blind_enter,
-                "筛选失败原因": screen_fail_reason if clean_text(row.get("受试者状态")) == "筛选失败" else "",
-                "双盲期进入日期": blind_enter,
-                "双盲期完成日期": blind_complete,
-                "开放期进入日期": open_enter,
-                "开放期完成日期": open_complete or MISSING_TEXT,
-                "是否完成双盲期": completed_blind,
-                "是否完成开放期": completed_open,
+                "筛选日期": screen_date or MISSING_TEXT,
+                "知情同意日期": parse_date(get_row_value(ic, ["知情同意签署日期(ICFDAT)", "首次签署知情同意书日期", "知情同意日期"])) or MISSING_TEXT,
+                "基线/随机日期": baseline_date or MISSING_TEXT,
+                "筛选失败原因": screen_fail_reason if subject_status == "筛选失败" else "",
                 "是否完成研究": completed_study,
-                "是否进入ITT": "是" if clean_text(rand.get("受试者是否入组本研究？")) == "是" else MISSING_TEXT,
-                "是否进入PKCS": "是" if clean_text(rand.get("是否进行PK血样采集？")) == "是" or pk_flags[subject] else "否",
+                "是否进入ITT": "是" if randomized else "否",
+                "是否进入PKCS": "是" if clean_text(get_row_value(rand, ["是否进行PK血样采集？", "是否进行PK血样采集"])) == "是" or pk_flags[subject] else "否",
                 "是否存在AE/SAE/SUSAR": "AE" if ae_flags[subject]["ae"] and not ae_flags[subject]["sae"] else ("SAE" if ae_flags[subject]["sae"] else "否"),
                 "是否存在AE": "是" if ae_flags[subject]["ae"] else "否",
                 "是否存在PD": MISSING_TEXT,
@@ -1844,9 +2207,11 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
                 "是否存在核查Finding": "否",
                 "是否为重点核查受试者": MISSING_TEXT,
                 "数据完整性风险等级": "待定",
-                "研究结束日期": parse_date(dseos.get("研究结束日期")) or MISSING_TEXT,
-                "治疗结束日期": parse_date(dseot.get("末次给药日期")) or MISSING_TEXT,
+                "研究结束日期": parse_date(get_row_value(ds, ["完成试验/提前退出日期(DSDAT)", "研究结束日期"])) or parse_date(get_row_value(dseos, ["研究结束日期"])) or MISSING_TEXT,
+                "治疗结束日期": parse_date(get_row_value(dseot, ["末次给药日期", "治疗结束日期"])) or MISSING_TEXT,
                 "受试者报表随机号": report_row.get("随机号", ""),
+                "是否已随机": "是" if randomized else "否",
+                **phase_fields,
             }
         )
     profiles.sort(key=lambda x: (x["中心"], x["受试者编号"]))
@@ -1922,24 +2287,25 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
         sheet = read_listing_sheet(LISTING_XLSX, config["sheet"])
         grouped = defaultdict(list)
         for row in sheet["records"]:
-            center = standardize_center_name(row.get("研究中心"))
-            subject = clean_text(row.get("受试者"))
+            center = extract_center_from_row(row)
+            subject = extract_subject_from_row(row)
             if center not in TARGET_CENTERS or not subject:
                 continue
-            visit_oid = clean_text(row.get("访视OID"))
-            grouped[(subject, visit_oid)].append(row)
+            visit_meta = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视OID", "访视编号", "访视名称", "访视"]))
+            visit_oid = visit_meta["visit_id"] or clean_text(get_row_value(row, ["访视OID", "访视编号"]))
+            date_value = parse_date(row.get(config["date_col"])) or parse_date(get_row_value(row, [config["date_col"], "评估日期(RESDAT)", "评估日期", "日期", "访视日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", "")
+            group_key = (subject, visit_oid, date_value) if config.get("aggregate") == "visit_date" else (subject, visit_oid, "")
+            grouped[group_key].append(row)
 
-        for (subject, visit_oid), rows in grouped.items():
+        for (subject, visit_oid, grouped_date), rows in grouped.items():
             first = rows[0]
             metric = config["metric"]
             raw_value = first.get(config["value_col"])
-            numeric_value = parse_iga_score(raw_value) if metric == "IGA" else to_float(raw_value)
-            date_value = parse_date(first.get(config["date_col"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", "")
+            numeric_value = parse_iga_score(raw_value) if config.get("value_parser") == "iga" or metric == "IGA" else to_float(raw_value)
+            date_value = grouped_date or parse_date(first.get(config["date_col"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", "")
             duplicate_count = len(rows)
             note_parts = []
-            if duplicate_count > 1 and config["aggregate"] == "total_with_details":
-                note_parts.append(f"同一访视按部位展开 {duplicate_count} 条记录，已汇总为单个总分数据点")
-            elif duplicate_count > 1:
+            if duplicate_count > 1 and config.get("aggregate") not in {"visit_date"}:
                 note_parts.append("同一指标同一访视存在多条记录，需人工复核")
             if not date_value:
                 note_parts.append("日期缺失")
@@ -1951,16 +2317,18 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
 
             details = []
             for item in rows:
-                details.append({field: clean_text(item.get(field)) for field in config["detail_fields"] if clean_text(item.get(field))})
+                detail_fields = config.get("detail_fields", [])
+                if detail_fields:
+                    details.append({field: clean_text(item.get(field)) for field in detail_fields if clean_text(item.get(field))})
 
             merged = {
-                "中心": standardize_center_name(first.get("研究中心")),
+                "中心": extract_center_from_row(first),
                 "受试者编号": subject,
-                "受试者键": f"{standardize_center_name(first.get('研究中心'))}|{subject}",
+                "受试者键": f"{extract_center_from_row(first)}|{subject}",
                 "指标名称": metric,
                 "指标分组": config["group"],
                 "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": clean_text(first.get("访视名称")) or planned.get("访视名称", MISSING_TEXT),
+                "访视名称": extract_data_section(first) or planned.get("访视名称", MISSING_TEXT),
                 "日期": date_value or MISSING_TEXT,
                 "原始值": clean_text(raw_value) or MISSING_TEXT,
                 "数值结果": numeric_value,
@@ -1986,7 +2354,7 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
                 baseline_row = row
                 break
         if baseline_row is None:
-            rows_sorted = sorted(rows, key=lambda x: (x["日期"] == MISSING_TEXT, x["日期"], x["访视编号"]))
+            rows_sorted = sorted(rows, key=lambda x: (x["访视编号"] == "SCR", x["日期"] == MISSING_TEXT, x["日期"], phase_visit_sort_key(x["访视编号"], x["日期"])))
             baseline_row = rows_sorted[0] if rows_sorted else None
         baseline = baseline_row["数值结果"] if baseline_row else None
         for row in rows:
@@ -2125,18 +2493,21 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
         lab_category = lab_config["lab_category"]
         sheet = read_listing_sheet(LISTING_XLSX, sheet_name)
         for row in sheet["records"]:
-            center = standardize_center_name(row.get("研究中心"))
-            subject = clean_text(row.get("受试者"))
+            center = extract_center_from_row(row)
+            subject = extract_subject_from_row(row)
             if center not in TARGET_CENTERS or not subject:
                 continue
-            visit_oid = clean_text(row.get("访视OID"))
-            test_name = clean_text(row.get("检查项目"))
+            visit_meta = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视OID", "访视编号", "访视名称", "访视"]))
+            visit_oid = visit_meta["visit_id"] or clean_text(get_row_value(row, ["访视OID", "访视编号"]))
+            test_name = clean_text(get_row_value(row, ["检查项目", "实验室指标名称", "LBTEST"]))
             if not should_include_lab_test(test_name, lab_category):
                 continue
             metric_name = standardize_lab_test_name(test_name)
-            value_info = classify_lab_value_for_plot(test_name, row.get("检查结果"), row.get("单位"))
-            clinical_significance = clean_text(row.get("临床意义评价")) or MISSING_TEXT
-            clinical_comment = clean_text(row.get("异常有临床意义，请说明"))
+            raw_result = get_row_value(row, ["检查结果", "结果", "LBORRES", "LBSTRES"])
+            raw_unit = get_row_value(row, ["单位", "单位(VSORRESU)", "LBORRESU"])
+            value_info = classify_lab_value_for_plot(test_name, raw_result, raw_unit)
+            clinical_significance = clean_text(get_row_value(row, ["临床意义评价", "临床评估"])) or MISSING_TEXT
+            clinical_comment = clean_text(get_row_value(row, ["异常有临床意义，请说明", "异常说明", "备注"]))
             lab_row = normalize_lab_row(
                 {
                     "中心": center,
@@ -2145,15 +2516,15 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                     "实验室类别": lab_category,
                     "实验室显示分组": infer_lab_group(metric_name, lab_category),
                     "访视编号": visit_oid or MISSING_TEXT,
-                    "访视名称": clean_text(row.get("访视名称")) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
-                    "日期": parse_date(row.get("采样日期")) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
+                    "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                    "日期": parse_date(get_row_value(row, ["采样日期", "采样日期(LBDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
                     "检验项目标准化名称": metric_name,
                     "原始检验项目名称": test_name or MISSING_TEXT,
-                    "结果值": clean_text(row.get("检查结果")) or MISSING_TEXT,
-                    "单位": clean_text(row.get("单位")) or MISSING_TEXT,
-                    "正常值下限": clean_text(row.get("下限")),
-                    "正常值上限": clean_text(row.get("上限")),
-                    "正常范围原始文本": clean_text(row.get("标准值")) or "",
+                    "结果值": clean_text(raw_result) or MISSING_TEXT,
+                    "单位": clean_text(raw_unit) or MISSING_TEXT,
+                    "正常值下限": clean_text(get_row_value(row, ["下限", "正常值范围下限（如有，请填写）(USVORNRL)"])),
+                    "正常值上限": clean_text(get_row_value(row, ["上限", "正常值范围上限（如有，请填写）(USVORNRH)"])),
+                    "正常范围原始文本": clean_text(get_row_value(row, ["标准值", "实验室范围名称"])) or "",
                     "CTCAE分级": MISSING_TEXT,
                     "临床意义判断": clinical_significance,
                     "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
@@ -2161,10 +2532,10 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                     "是否转归正常": MISSING_TEXT,
                     "是否对应AE或Finding": "否",
                     "数据来源sheet": sheet_name,
-                    "原始字段名": "检查结果",
+                    "原始字段名": find_matching_header(list(row.keys()), ["检查结果", "结果"]) or "结果",
                     "是否需人工复核": "是" if value_info["plot_mode"] == "categorical" and lab_category != "尿常规" else "否",
                     "图表模式": value_info["plot_mode"],
-                    "正常值范围标记": clean_text(row.get("正常值范围标记")),
+                    "正常值范围标记": clean_text(get_row_value(row, ["正常值范围标记"])),
                     "额外关注标记": "",
                 }
             )
@@ -2173,13 +2544,16 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
 
     eg_sheet = read_listing_alias("EG", optional=True)
     for row in eg_sheet["records"]:
-        center = standardize_center_name(row.get("研究中心"))
-        subject = clean_text(row.get("受试者"))
+        center = extract_center_from_row(row)
+        subject = extract_subject_from_row(row)
         if center not in TARGET_CENTERS or not subject:
             continue
-        if clean_text(row.get("是否进行12导联心电图检查？")) != "是":
+        if clean_text(get_row_value(row, ["是否进行12导联心电图检查？", "是否检查(EGPERF)", "是否检查"])) not in {"", "是"}:
             continue
-        visit_oid = clean_text(row.get("访视OID"))
+        if clean_text(get_row_value(row, ["QTcF(EGQTCF)", "QTc间期", "QTcF"])) == "":
+            continue
+        visit_meta = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视OID", "访视编号", "访视名称", "访视"]))
+        visit_oid = visit_meta["visit_id"] or clean_text(get_row_value(row, ["访视OID", "访视编号"]))
         metric_name = "QTc间期"
         lab_row = normalize_lab_row(
             {
@@ -2189,23 +2563,23 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                 "实验室类别": "心电图",
                 "实验室显示分组": "心电图",
                 "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": clean_text(row.get("访视名称")) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
-                "日期": parse_date(row.get("检查日期")) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
+                "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                "日期": parse_date(get_row_value(row, ["检查日期(EGDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
                 "检验项目标准化名称": metric_name,
                 "原始检验项目名称": metric_name,
-                "结果值": clean_text(row.get("QTc间期")) or MISSING_TEXT,
-                "单位": clean_text(row.get("QTc间期_UNIT")) or MISSING_TEXT,
+                "结果值": clean_text(get_row_value(row, ["QTcF(EGQTCF)", "QTc间期", "QTcF"])) or MISSING_TEXT,
+                "单位": clean_text(get_row_value(row, ["QTc间期_UNIT", "单位"])) or MISSING_TEXT,
                 "正常值下限": "",
                 "正常值上限": "",
                 "正常范围原始文本": "",
                 "CTCAE分级": MISSING_TEXT,
-                "临床意义判断": clean_text(row.get("临床意义评价")) or MISSING_TEXT,
-                "研究者临床评估": "" if clean_text(row.get("临床意义评价")) == "正常" else clean_text(row.get("异常有临床意义，请说明")),
+                "临床意义判断": clean_text(get_row_value(row, ["临床意义评价", "临床评估(EGCLSIG)", "临床评估"])) or MISSING_TEXT,
+                "研究者临床评估": "" if clean_text(get_row_value(row, ["临床意义评价", "临床评估(EGCLSIG)", "临床评估"])) == "正常" else clean_text(get_row_value(row, ["若异常，请详述(EGABCO)", "异常说明(EGABCS)", "备注"])),
                 "备注": "",
                 "是否转归正常": MISSING_TEXT,
                 "是否对应AE或Finding": "否",
                 "数据来源sheet": eg_sheet["sheet_name"] or MISSING_TEXT,
-                "原始字段名": "QTc间期",
+                "原始字段名": find_matching_header(list(row.keys()), ["QTcF(EGQTCF)", "QTc间期", "QTcF"]) or "QTcF",
                 "是否需人工复核": "否",
                 "图表模式": "numeric",
                 "正常值范围标记": "",
@@ -2214,6 +2588,60 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
         )
         rows.append(lab_row)
         by_subject_metric[(subject, metric_name)].append(lab_row)
+
+    if INCLUDE_USV == "yes":
+        wb = openpyxl.load_workbook(LISTING_XLSX, read_only=True, data_only=True)
+        try:
+            if "USV" in wb.sheetnames:
+                usv_sheet = read_listing_sheet(LISTING_XLSX, "USV")
+                for row in usv_sheet["records"]:
+                    center = extract_center_from_row(row)
+                    subject = extract_subject_from_row(row)
+                    if center not in TARGET_CENTERS or not subject:
+                        continue
+                    test_name = clean_text(get_row_value(row, ["检查项目(USVTEST)", "检查项目"]))
+                    if not test_name:
+                        continue
+                    metric_name = standardize_lab_test_name(test_name)
+                    lab_category = "尿常规" if "尿" in test_name else "血生化"
+                    value_info = classify_lab_value_for_plot(test_name, get_row_value(row, ["检查结果(USVORRES)", "检查结果"]), get_row_value(row, ["单位（如有，请填写）(USVORESU)", "单位"]))
+                    clinical_significance = clean_text(get_row_value(row, ["临床评估(USVCLSIG)", "临床评估"])) or MISSING_TEXT
+                    clinical_comment = clean_text(get_row_value(row, ["异常，请说明(USVABCS)", "备注(USVCO)", "备注"]))
+                    lab_row = normalize_lab_row(
+                        {
+                            "中心": center,
+                            "受试者编号": subject,
+                            "受试者键": f"{center}|{subject}",
+                            "实验室类别": lab_category,
+                            "实验室显示分组": infer_lab_group(metric_name, lab_category),
+                            "访视编号": "USV",
+                            "访视名称": "计划外访视",
+                            "日期": parse_date(get_row_value(row, ["检查日期(USVDAT)", "检查日期"])) or MISSING_TEXT,
+                            "检验项目标准化名称": metric_name,
+                            "原始检验项目名称": test_name,
+                            "结果值": clean_text(get_row_value(row, ["检查结果(USVORRES)", "检查结果"])) or MISSING_TEXT,
+                            "单位": clean_text(get_row_value(row, ["单位（如有，请填写）(USVORESU)", "单位"])) or MISSING_TEXT,
+                            "正常值下限": clean_text(get_row_value(row, ["正常值范围下限（如有，请填写）(USVORNRL)", "下限"])),
+                            "正常值上限": clean_text(get_row_value(row, ["正常值范围上限（如有，请填写）(USVORNRH)", "上限"])),
+                            "正常范围原始文本": "",
+                            "CTCAE分级": MISSING_TEXT,
+                            "临床意义判断": clinical_significance,
+                            "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
+                            "备注": "",
+                            "是否转归正常": MISSING_TEXT,
+                            "是否对应AE或Finding": "否",
+                            "数据来源sheet": "USV",
+                            "原始字段名": "检查结果(USVORRES)",
+                            "是否需人工复核": "是" if value_info["plot_mode"] == "categorical" and lab_category != "尿常规" else "否",
+                            "图表模式": value_info["plot_mode"],
+                            "正常值范围标记": "",
+                            "额外关注标记": "",
+                        }
+                    )
+                    rows.append(lab_row)
+                    by_subject_metric[(subject, lab_row["检验项目标准化名称"])].append(lab_row)
+        finally:
+            wb.close()
 
     for (_, _), metric_rows in by_subject_metric.items():
         apply_longitudinal_attention_flags(metric_rows, "检验项目标准化名称", "实验室类别")
@@ -2225,55 +2653,103 @@ def build_vital_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list
     rows: list[dict[str, Any]] = []
     by_subject_metric: defaultdict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     sheet = read_listing_alias("VS")
-    metric_columns = [
-        ("体温", "体温", "体温_UNIT"),
-        ("心率", "脉搏", "脉搏_UNIT"),
-        ("收缩压", "收缩压", "收缩压_UNIT"),
-        ("舒张压", "舒张压", "舒张压_UNIT"),
-    ]
     for row in sheet["records"]:
-        center = standardize_center_name(row.get("研究中心"))
-        subject = clean_text(row.get("受试者"))
+        center = extract_center_from_row(row)
+        subject = extract_subject_from_row(row)
         if center not in TARGET_CENTERS or not subject:
             continue
-        if clean_text(row.get("是否进行生命体征检查？")) != "是":
+        if clean_text(get_row_value(row, ["是否进行生命体征检查？", "是否检查(VSPERF)", "是否检查"])) not in {"", "是"}:
             continue
-        visit_oid = clean_text(row.get("访视OID"))
-        clinical_significance = clean_text(row.get("临床意义评价")) or MISSING_TEXT
-        clinical_comment = clean_text(row.get("异常有临床意义，请说明"))
-        for metric_name, raw_col, unit_col in metric_columns:
-            value = clean_text(row.get(raw_col))
-            if not value or value == MISSING_TEXT:
-                continue
-            low, high = vital_reference_range(metric_name)
-            vital_row = normalize_lab_row(
-                {
-                    "中心": center,
-                    "受试者编号": subject,
-                    "受试者键": f"{center}|{subject}",
-                    "生命体征类别": "生命体征",
-                    "访视编号": visit_oid or MISSING_TEXT,
-                    "访视名称": clean_text(row.get("访视名称")) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
-                    "日期": parse_date(row.get("检查日期")) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
-                    "生命体征指标": metric_name,
-                    "原始指标名称": raw_col,
-                    "结果值": value,
-                    "单位": clean_text(row.get(unit_col)) or MISSING_TEXT,
-                    "正常值下限": "" if low is None else f"{low:g}",
-                    "正常值上限": "" if high is None else f"{high:g}",
-                    "正常范围原始文本": "",
-                    "临床意义判断": clinical_significance,
-                    "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
-                    "备注": "",
-                    "是否对应AE或Finding": "否",
-                    "数据来源sheet": sheet["sheet_name"] or MISSING_TEXT,
-                    "原始字段名": raw_col,
-                    "图表模式": "numeric",
-                    "额外关注标记": "",
-                }
-            )
-            rows.append(vital_row)
-            by_subject_metric[(subject, metric_name)].append(vital_row)
+        visit_meta = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视OID", "访视编号", "访视名称", "访视"]))
+        visit_oid = visit_meta["visit_id"] or clean_text(get_row_value(row, ["访视OID", "访视编号"]))
+        clinical_significance = clean_text(get_row_value(row, ["临床意义评价", "临床评估(VSCLSIG)", "临床评估"])) or MISSING_TEXT
+        clinical_comment = clean_text(get_row_value(row, ["异常有临床意义，请说明", "异常说明(VSABCS)", "备注"]))
+        test_name = clean_text(get_row_value(row, ["检查项目(VSTEST)", "检查项目"]))
+        test_map = {"体温": "体温", "脉搏": "心率", "心率": "心率", "收缩压": "收缩压", "舒张压": "舒张压"}
+        metric_name = test_map.get(test_name, "")
+        if not metric_name:
+            continue
+        value = clean_text(get_row_value(row, ["检查结果(VSORRES)", "检查结果"]))
+        if not value or value == MISSING_TEXT:
+            continue
+        low, high = vital_reference_range(metric_name)
+        vital_row = normalize_lab_row(
+            {
+                "中心": center,
+                "受试者编号": subject,
+                "受试者键": f"{center}|{subject}",
+                "生命体征类别": "生命体征",
+                "访视编号": visit_oid or MISSING_TEXT,
+                "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                "日期": parse_date(get_row_value(row, ["检查日期(VSDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
+                "生命体征指标": metric_name,
+                "原始指标名称": test_name,
+                "结果值": value,
+                "单位": clean_text(get_row_value(row, ["单位(VSORRESU)", "单位"])) or MISSING_TEXT,
+                "正常值下限": "" if low is None else f"{low:g}",
+                "正常值上限": "" if high is None else f"{high:g}",
+                "正常范围原始文本": "",
+                "临床意义判断": clinical_significance,
+                "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
+                "备注": "",
+                "是否对应AE或Finding": "否",
+                "数据来源sheet": sheet["sheet_name"] or MISSING_TEXT,
+                "原始字段名": find_matching_header(list(row.keys()), ["检查结果(VSORRES)", "检查结果"]) or "检查结果",
+                "图表模式": "numeric",
+                "额外关注标记": "",
+            }
+        )
+        rows.append(vital_row)
+        by_subject_metric[(subject, metric_name)].append(vital_row)
+
+    if INCLUDE_USV == "yes":
+        wb = openpyxl.load_workbook(LISTING_XLSX, read_only=True, data_only=True)
+        try:
+            if "USV" in wb.sheetnames:
+                usv_sheet = read_listing_sheet(LISTING_XLSX, "USV")
+                for row in usv_sheet["records"]:
+                    center = extract_center_from_row(row)
+                    subject = extract_subject_from_row(row)
+                    if center not in TARGET_CENTERS or not subject:
+                        continue
+                    test_name = clean_text(get_row_value(row, ["检查项目(USVTEST)", "检查项目"]))
+                    test_map = {"体温": "体温", "脉搏": "心率", "心率": "心率", "收缩压": "收缩压", "舒张压": "舒张压"}
+                    metric_name = test_map.get(test_name, "")
+                    if not metric_name:
+                        continue
+                    low, high = vital_reference_range(metric_name)
+                    clinical_significance = clean_text(get_row_value(row, ["临床评估(USVCLSIG)", "临床评估"])) or MISSING_TEXT
+                    clinical_comment = clean_text(get_row_value(row, ["异常，请说明(USVABCS)", "备注(USVCO)", "备注"]))
+                    vital_row = normalize_lab_row(
+                        {
+                            "中心": center,
+                            "受试者编号": subject,
+                            "受试者键": f"{center}|{subject}",
+                            "生命体征类别": "生命体征",
+                            "访视编号": "USV",
+                            "访视名称": "计划外访视",
+                            "日期": parse_date(get_row_value(row, ["检查日期(USVDAT)", "检查日期"])) or MISSING_TEXT,
+                            "生命体征指标": metric_name,
+                            "原始指标名称": test_name,
+                            "结果值": clean_text(get_row_value(row, ["检查结果(USVORRES)", "检查结果"])) or MISSING_TEXT,
+                            "单位": clean_text(get_row_value(row, ["单位（如有，请填写）(USVORESU)", "单位"])) or MISSING_TEXT,
+                            "正常值下限": "" if low is None else f"{low:g}",
+                            "正常值上限": "" if high is None else f"{high:g}",
+                            "正常范围原始文本": "",
+                            "临床意义判断": clinical_significance,
+                            "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
+                            "备注": "",
+                            "是否对应AE或Finding": "否",
+                            "数据来源sheet": "USV",
+                            "原始字段名": "检查结果(USVORRES)",
+                            "图表模式": "numeric",
+                            "额外关注标记": "",
+                        }
+                    )
+                    rows.append(vital_row)
+                    by_subject_metric[(subject, metric_name)].append(vital_row)
+        finally:
+            wb.close()
 
     for (_, _), metric_rows in by_subject_metric.items():
         apply_longitudinal_attention_flags(metric_rows, "生命体征指标", "生命体征类别")
@@ -2884,6 +3360,19 @@ def build_protocol_summary_markdown(protocol_summary: dict[str, Any]) -> str:
         lines.append(f"- {'；'.join(visit_mentions[:30])}")
     else:
         lines.append("- 未识别到明确访视提及。")
+    lines.extend(["", "## 研究分期"])
+    phases = protocol_summary.get("study_phases", [])
+    if phases:
+        for item in phases:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 未识别到明确研究分期。")
+    lines.extend(["", "## 方案提示需收集的评估类别"])
+    assessments = protocol_summary.get("required_assessments", [])
+    if assessments:
+        lines.append(f"- {'；'.join(assessments)}")
+    else:
+        lines.append("- 未从方案文本中识别到明确评估类别。")
     return "\n".join(lines) + "\n"
 
 
@@ -3456,7 +3945,7 @@ function basicFieldsForSubject(subject) {{
   if (subject["受试者状态"] === "筛选失败") {{
     return ["中心","受试者编号","年龄","年龄组","性别","知情同意日期","筛选失败原因","是否存在AE/PD/Finding"];
   }}
-  return ["中心","受试者编号","年龄","年龄组","性别","随机组别","筛选日期","知情同意日期","基线/随机日期","双盲期进入日期","双盲期完成日期","开放期进入日期","开放期完成日期","是否完成双盲期","是否完成开放期","是否完成研究","是否进入ITT","是否进入PKCS","是否存在AE/PD/Finding","实验室特殊关注","生命体征特殊关注"];
+  return ["中心","受试者编号","年龄","年龄组","性别","随机组别","筛选日期","知情同意日期","基线/随机日期", ...(DATA.phase_field_labels || []), "是否完成研究","是否进入ITT","是否进入PKCS","是否存在AE/PD/Finding","实验室特殊关注","生命体征特殊关注"];
 }}
 function subjectTags(subject) {{
   const tags = [];
@@ -3597,6 +4086,12 @@ def build_payload() -> dict[str, Any]:
     vital_rows = build_vital_rows(visit_index)
     finding_rows = build_finding_rows()
     ae_rows = build_ae_rows()
+    allowed_subject_keys = {row["受试者键"] for row in subject_profiles}
+    efficacy_rows = [row for row in efficacy_rows if row.get("受试者键") in allowed_subject_keys]
+    lab_rows = [row for row in lab_rows if row.get("受试者键") in allowed_subject_keys]
+    vital_rows = [row for row in vital_rows if row.get("受试者键") in allowed_subject_keys]
+    finding_rows = [row for row in finding_rows if not row.get("受试者键") or row.get("受试者键") in allowed_subject_keys]
+    ae_rows = [row for row in ae_rows if row.get("受试者键") in allowed_subject_keys]
     attach_finding_links(subject_profiles, efficacy_rows, lab_rows, finding_rows, ae_rows, vital_rows)
     summarize_lab_attention_by_subject(subject_profiles, lab_rows)
     summarize_vital_attention_by_subject(subject_profiles, vital_rows)
@@ -3613,21 +4108,18 @@ def build_payload() -> dict[str, Any]:
     unresolved_markdown = build_unresolved_questions(field_mapping, qc, subject_profiles, finding_rows)
     efficacy_metric_count = len(unique([r["指标名称"] for r in efficacy_rows]))
     lab_metric_count = len(unique([r["检验项目标准化名称"] for r in lab_rows]))
-    final_check_statement = {
-        "已读取的数据源": "主listing + Finding台账 + 方案偏离分类表 + 受试者报表 + 旧版HTML只读参照",
-        "已纳入的中心": "；".join(TARGET_CENTERS),
-        "已纳入的受试者数量": str(len(subject_profiles)),
-        "已纳入的疗效指标数量": str(efficacy_metric_count),
-        "已纳入的实验室指标数量": str(lab_metric_count),
-        "已纳入的Finding数量": str(len(finding_rows)),
-        "已完成的QC项目": str(len(qc["summary"])),
-        "仍需人工复核的问题": str(sum(1 for row in qc["summary"] if row["结果"] != "通过")),
-        "核对声明": "已对字段结构、受试者主键、疗效与实验室纵表、Finding固定展示逻辑及核心QC项进行实际核对；未将结果笼统表述为全部准确。",
-    }
+    phase_field_labels = []
+    for phase_name in STUDY_PHASES:
+        if clean_text(phase_name):
+            phase_field_labels.extend([f"{phase_name}进入日期", f"{phase_name}完成日期"])
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "centers": TARGET_CENTERS,
         "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
+        "study_phases": STUDY_PHASES[:],
+        "phase_field_labels": phase_field_labels,
+        "subject_scope": SUBJECT_SCOPE,
+        "include_usv": INCLUDE_USV,
         "subjects": subject_profiles,
         "efficacy": efficacy_rows,
         "labs": lab_rows,
@@ -3640,8 +4132,33 @@ def build_payload() -> dict[str, Any]:
         "issue_log": qc["issues"],
         "completeness": qc["completeness"],
         "unresolved_markdown": unresolved_markdown,
-        "final_check_statement": final_check_statement,
+        "efficacy_metric_count": efficacy_metric_count,
+        "lab_metric_count": lab_metric_count,
     }
+
+
+def validate_payload_or_raise(payload: dict[str, Any]) -> None:
+    blocking_questions: list[str] = []
+    subjects = payload.get("subjects", [])
+    efficacy = payload.get("efficacy", [])
+    selected_metrics = {item["metric"] for item in PROTOCOL_SUMMARY.get("selected_metrics", [])}
+    metrics_with_rows = {clean_text(row.get("指标名称")) for row in efficacy}
+    for metric in sorted(selected_metrics - metrics_with_rows):
+        blocking_questions.append(f"{metric} 在方案终点解构中已识别，但当前listing未成功生成该指标数据。请指出 {metric} 位于哪个listing的哪个sheet、哪一列，或明确本轮不纳入。")
+    for subject in subjects[:]:
+        if clean_text(subject.get("受试者状态")) == "筛选失败":
+            continue
+        for field in ["筛选日期", "知情同意日期", "基线/随机日期"]:
+            if clean_text(subject.get(field)) == MISSING_TEXT:
+                blocking_questions.append(f"{field} 无法定位。请指出在哪个listing的哪个sheet、以哪一例记录进行识别。示例受试者：{subject.get('受试者编号')}。")
+                break
+    if blocking_questions:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / "blocking_questions.md").write_text(
+            "# 构建已中止：需用户确认的关键问题\n\n" + "\n".join(f"- {item}" for item in unique(blocking_questions)),
+            encoding="utf-8",
+        )
+        raise SystemExit("Blocking data questions detected. Review output/blocking_questions.md before building HTML.")
 
 
 def main() -> None:
@@ -3655,6 +4172,7 @@ def main() -> None:
     if not precheck["ready_to_build"]:
         raise SystemExit("Input precheck failed. Review output/input_precheck.md and resolve blocking issues before building.")
     payload = build_payload()
+    validate_payload_or_raise(payload)
     write_csv(OUTPUT_DIR / "cleaned_subject_profile_dataset.csv", payload["subjects"])
     write_csv(OUTPUT_DIR / "efficacy_longitudinal_dataset.csv", payload["efficacy"])
     write_csv(OUTPUT_DIR / "lab_longitudinal_dataset.csv", payload["labs"])

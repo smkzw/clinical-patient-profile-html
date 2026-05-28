@@ -10,6 +10,8 @@
 ```bash
 python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_profile_html.py \
   --work-dir "<项目文件夹>" \
+  --subject-scope randomized \
+  --include-usv no \
   --output-dir "<项目文件夹>/patient_profile_output" \
   --precheck-only
 ```
@@ -30,6 +32,8 @@ python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_prof
 python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_profile_html.py \
   --work-dir "<项目文件夹>" \
   --config-json "<项目文件夹>/patient_profile_output/suggested_project_config.json" \
+  --subject-scope randomized \
+  --include-usv no \
   --output-dir "<项目文件夹>/patient_profile_output"
 ```
 

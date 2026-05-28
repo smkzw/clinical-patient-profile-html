@@ -18,6 +18,14 @@ Use short, concrete questions.
 
 `识别到多个中心。请确认是纳入全部中心，还是仅纳入以下中心：<center list>？`
 
+### Subject scope
+
+`请确认本轮是纳入全部受试者，还是仅纳入已随机受试者。若纳入全部受试者，中心层面的筛选期数据可能与CSR统计不完全一致。`
+
+### USV scope
+
+`请确认是否纳入USV/计划外访视数据。若纳入，仅在个例层面展示，并按USV实际日期放入历时图表。`
+
 ### Main listing workbook
 
 `当前目录识别到多个可能的主listing文件。请确认以哪一个作为主数据源：<file list>？`
@@ -33,6 +41,14 @@ Use short, concrete questions.
 ### Endpoint variable type
 
 `方案中提到了 <metric>，但当前无法判断它应按连续型还是二分类展示。请确认该指标的展示口径。`
+
+### Critical profile field missing
+
+`<field name> 无法稳定定位。请指出它位于哪个listing、哪个sheet、使用哪一列识别；如有多个候选记录，请说明应采用哪一条。`
+
+### Protocol-required assessment missing
+
+`研究流程表提示需要收集 <assessment>，但当前listing中未识别到对应数据。请指出该数据位于哪个sheet，或明确本轮不纳入。`
 
 ### Optional exclusion
 
