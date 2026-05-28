@@ -127,7 +127,7 @@ The builder writes at least these files to the chosen output directory:
 - `protocol_endpoint_summary.md`
 - `protocol_endpoint_summary.json`
 
-The output HTML must stay Chinese-first in title, labels, filters, tables, and review text, consistent with the prior RUX patient-profile style.
+The output HTML must stay Chinese-first in title, labels, filters, tables, and review text, using a professional internal-review style rather than project-specific wording.
 
 ## References
 

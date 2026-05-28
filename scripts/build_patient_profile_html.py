@@ -215,6 +215,26 @@ def parse_phase_visit_label(label: Any) -> dict[str, str]:
     return {"phase": phase or text, "visit_name": visit_name, "visit_id": visit_id or text}
 
 
+def simplify_visit_label(visit_id: Any, raw_name: Any = "") -> str:
+    code = clean_text(visit_id)
+    raw = clean_text(raw_name)
+    if code in {"SCR", "SCREEN"} or "筛选" in raw:
+        return "SCR"
+    if code in {"USV", "UNS"} or "计划外" in raw or "非计划" in raw:
+        return "USV"
+    if code in {"COMMON"} or "共同页" in raw:
+        return "COMMON"
+    if code in {"EOT", "EOS"}:
+        return code
+    match = re.search(r"D-?\d+", code, re.I) or re.search(r"D-?\d+", raw, re.I)
+    if match:
+        return clean_text(match.group(0)).upper()
+    match = re.search(r"W\d+", code, re.I) or re.search(r"W\d+", raw, re.I)
+    if match:
+        return clean_text(match.group(0)).upper()
+    return code or raw or MISSING_TEXT
+
+
 def phase_visit_sort_key(visit_id: str, date_text: str) -> tuple[int, int, str]:
     visit = clean_text(visit_id)
     if visit == "SCR":
@@ -1437,9 +1457,10 @@ def is_excluded_center_summary_visit(visit_id: Any, visit_name: Any) -> bool:
 
 def summary_group_label(group_name: Any) -> str:
     text = clean_text(group_name)
-    if "芦可替尼" in text:
+    low = text.lower()
+    if any(token in text for token in ["试验组", "治疗组"]) or any(token in low for token in ["active", "treatment", "experimental"]):
         return "试验组"
-    if "安慰剂" in text:
+    if any(token in text for token in ["对照组", "安慰剂"]) or any(token in low for token in ["placebo", "control", "comparator"]):
         return "对照组"
     return ""
 
@@ -1485,10 +1506,12 @@ def unique(values: list[Any]) -> list[Any]:
 
 def normalize_study_group(raw_group: Any) -> str:
     text = clean_text(raw_group)
-    if "安慰剂" in text:
-        return "安慰剂组"
-    if "磷酸芦可替尼" in text:
-        return "磷酸芦可替尼组"
+    if not text:
+        return MISSING_TEXT
+    if any(token in text for token in ["对照组", "安慰剂"]):
+        return text
+    if "试验组" in text or "治疗组" in text:
+        return text
     return text or MISSING_TEXT
 
 
@@ -1596,7 +1619,7 @@ def finding_matches_vital(finding: dict[str, Any], vital_row: dict[str, Any]) ->
         clean_text(vital_row.get("原始指标名称")),
         "生命体征",
     ]
-    visit_tokens = [clean_text(vital_row.get("访视编号")), clean_text(vital_row.get("访视名称"))]
+    visit_tokens = [clean_text(vital_row.get("访视编号")), clean_text(vital_row.get("访视名称")), clean_text(vital_row.get("访视原始名称"))]
     metric_match = any(token and token in text for token in metric_tokens if len(token) >= 2)
     visit_match = any(token and token in text for token in visit_tokens)
     return metric_match and visit_match
@@ -1609,7 +1632,7 @@ def finding_matches_efficacy(finding: dict[str, Any], efficacy_row: dict[str, An
         clean_text(finding.get(k))
         for k in ["原始问题描述", "涉及访视", "涉及数据点或文件", "问题分类"]
     )
-    visit_tokens = [clean_text(efficacy_row.get("访视编号")), clean_text(efficacy_row.get("访视名称"))]
+    visit_tokens = [clean_text(efficacy_row.get("访视编号")), clean_text(efficacy_row.get("访视名称")), clean_text(efficacy_row.get("访视原始名称"))]
     metric_tokens = [clean_text(efficacy_row.get("指标名称"))]
     visit_match = any(token and token in text for token in visit_tokens)
     metric_match = any(token and token in text for token in metric_tokens)
@@ -1628,7 +1651,7 @@ def finding_matches_lab(finding: dict[str, Any], lab_row: dict[str, Any]) -> boo
         clean_text(lab_row.get("原始检验项目名称")),
         clean_text(lab_row.get("实验室类别")),
     ]
-    visit_tokens = [clean_text(lab_row.get("访视编号")), clean_text(lab_row.get("访视名称"))]
+    visit_tokens = [clean_text(lab_row.get("访视编号")), clean_text(lab_row.get("访视名称")), clean_text(lab_row.get("访视原始名称"))]
     metric_match = any(token and token in text for token in metric_tokens if len(token) >= 2)
     visit_match = any(token and token in text for token in visit_tokens)
     return metric_match and visit_match
@@ -2078,13 +2101,15 @@ def build_visit_index() -> dict[tuple[str, str], dict[str, str]]:
             continue
         parsed = parse_phase_visit_label(extract_data_section(row) or get_row_value(row, ["访视名称", "访视", "VISIT"]))
         visit = parsed["visit_id"]
+        display_visit = simplify_visit_label(visit, parsed["visit_name"])
         visit_date = parse_date(get_row_value(row, ["访视日期(VISDAT)", "访视日期", "VISDAT"]))
         existing = visit_index.get((subject, visit), {})
         if existing.get("访视日期") and visit_date and existing["访视日期"] <= visit_date:
             continue
         visit_index[(subject, visit)] = {
             "研究分期": parsed["phase"],
-            "访视名称": parsed["visit_name"] or extract_data_section(row) or MISSING_TEXT,
+            "访视名称": display_visit,
+            "访视原始名称": parsed["visit_name"] or extract_data_section(row) or MISSING_TEXT,
             "访视编号": visit or MISSING_TEXT,
             "访视日期": visit_date,
             "计划最早访视日期": parse_date(get_row_value(row, ["计划最早访视日期（系统生成）", "计划最早访视日期"])),
@@ -2130,7 +2155,8 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
             pk_flags[subject] = True
 
     visit_presence = defaultdict(list)
-    phase_names = STUDY_PHASES[:] or sorted({meta.get("研究分期", "") for meta in visit_index.values() if meta.get("研究分期")})
+    observed_phase_names = sorted({clean_text(meta.get("研究分期")) for meta in visit_index.values() if clean_text(meta.get("研究分期"))})
+    phase_names = [phase for phase in STUDY_PHASES if phase in observed_phase_names] or observed_phase_names
     for (subject, visit), meta in visit_index.items():
         if meta.get("访视日期"):
             visit_presence[subject].append(meta)
@@ -2328,7 +2354,8 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
                 "指标名称": metric,
                 "指标分组": config["group"],
                 "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": extract_data_section(first) or planned.get("访视名称", MISSING_TEXT),
+                "访视名称": planned.get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(first)),
+                "访视原始名称": extract_data_section(first) or planned.get("访视原始名称", MISSING_TEXT),
                 "日期": date_value or MISSING_TEXT,
                 "原始值": clean_text(raw_value) or MISSING_TEXT,
                 "数值结果": numeric_value,
@@ -2516,7 +2543,8 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                     "实验室类别": lab_category,
                     "实验室显示分组": infer_lab_group(metric_name, lab_category),
                     "访视编号": visit_oid or MISSING_TEXT,
-                    "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                    "访视名称": visit_index.get((subject, visit_oid), {}).get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(row)),
+                    "访视原始名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视原始名称", MISSING_TEXT),
                     "日期": parse_date(get_row_value(row, ["采样日期", "采样日期(LBDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
                     "检验项目标准化名称": metric_name,
                     "原始检验项目名称": test_name or MISSING_TEXT,
@@ -2563,7 +2591,8 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                 "实验室类别": "心电图",
                 "实验室显示分组": "心电图",
                 "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                "访视名称": visit_index.get((subject, visit_oid), {}).get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(row)),
+                "访视原始名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视原始名称", MISSING_TEXT),
                 "日期": parse_date(get_row_value(row, ["检查日期(EGDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
                 "检验项目标准化名称": metric_name,
                 "原始检验项目名称": metric_name,
@@ -2615,7 +2644,8 @@ def build_lab_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[d
                             "实验室类别": lab_category,
                             "实验室显示分组": infer_lab_group(metric_name, lab_category),
                             "访视编号": "USV",
-                            "访视名称": "计划外访视",
+                            "访视名称": "USV",
+                            "访视原始名称": "计划外访视",
                             "日期": parse_date(get_row_value(row, ["检查日期(USVDAT)", "检查日期"])) or MISSING_TEXT,
                             "检验项目标准化名称": metric_name,
                             "原始检验项目名称": test_name,
@@ -2680,7 +2710,8 @@ def build_vital_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list
                 "受试者键": f"{center}|{subject}",
                 "生命体征类别": "生命体征",
                 "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视名称", MISSING_TEXT),
+                "访视名称": visit_index.get((subject, visit_oid), {}).get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(row)),
+                "访视原始名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视原始名称", MISSING_TEXT),
                 "日期": parse_date(get_row_value(row, ["检查日期(VSDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
                 "生命体征指标": metric_name,
                 "原始指标名称": test_name,
@@ -2727,7 +2758,8 @@ def build_vital_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list
                             "受试者键": f"{center}|{subject}",
                             "生命体征类别": "生命体征",
                             "访视编号": "USV",
-                            "访视名称": "计划外访视",
+                            "访视名称": "USV",
+                            "访视原始名称": "计划外访视",
                             "日期": parse_date(get_row_value(row, ["检查日期(USVDAT)", "检查日期"])) or MISSING_TEXT,
                             "生命体征指标": metric_name,
                             "原始指标名称": test_name,
@@ -2798,6 +2830,22 @@ def impact_from_text(text: str, keywords: tuple[str, ...]) -> str:
     return "可能" if any(k.lower() in low for k in keywords) else "未见直接证据"
 
 
+def protocol_terms_for_roles(*roles: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    role_set = set(roles)
+    for item in PROTOCOL_SUMMARY.get("selected_metrics", []):
+        if not role_set or item.get("endpoint_role") in role_set:
+            metric = clean_text(item.get("metric"))
+            if metric:
+                terms.append(metric)
+    for item in PROTOCOL_SUMMARY.get("response_rules", []):
+        if not role_set or item.get("endpoint_role") in role_set:
+            label = clean_text(item.get("label"))
+            if label:
+                terms.append(label)
+    return tuple(unique([term for term in terms if term]))
+
+
 def build_medical_reply(record: dict[str, Any]) -> str:
     category = record["问题分类"]
     description = record["原始问题描述"]
@@ -2830,8 +2878,10 @@ def normalize_finding_row(row: dict[str, Any]) -> dict[str, Any]:
     category = standardize_problem_category(clean_text(row.get("问题分类")), clean_text(row.get("原始问题描述")))
     severity = standardize_problem_severity(clean_text(row.get("问题严重程度")))
     desc = clean_text(row.get("原始问题描述"))
-    impact_primary = impact_from_text(desc, ("IGA", "EASI", "NRS", "主要终点", "第8周", "疗效"))
-    impact_key_secondary = impact_from_text(desc, ("EASI75", "NRS", "关键次要", "SCORAD", "DLQI", "CDLQI", "PROMIS"))
+    primary_terms = protocol_terms_for_roles("主要终点") + ("主要终点", "primary endpoint", "primary efficacy")
+    key_secondary_terms = protocol_terms_for_roles("关键次要终点", "次要终点") + ("关键次要", "次要终点", "secondary endpoint")
+    impact_primary = impact_from_text(desc, primary_terms)
+    impact_key_secondary = impact_from_text(desc, key_secondary_terms)
     impact_safety = impact_from_text(desc, ("实验室", "AE", "SAE", "SUSAR", "安全", "胆红素", "中性粒", "血"))
     impact_eligibility = impact_from_text(desc, ("入选", "排除", "筛选", "知情", "合格性"))
     impact_data = impact_from_text(desc, ("不一致", "漏记", "漏填", "逻辑", "原始记录", "EDC", "回签", "无法定位"))
@@ -3387,6 +3437,20 @@ def selected_metric_variable_type(metric: str) -> str:
     return "continuous"
 
 
+def detect_transfer_marker_visit() -> str:
+    phases = {clean_text(item) for item in PROTOCOL_SUMMARY.get("study_phases", [])}
+    visits = {clean_text(item) for item in PROTOCOL_SUMMARY.get("visit_mentions", [])}
+    if any("开放" in phase for phase in phases) and any("双盲" in phase for phase in phases):
+        for candidate in ["D57", "D56", "D58"]:
+            if candidate in visits:
+                return candidate
+    if any("转组" in clean_text(item.get("source_excerpt")) for item in PROTOCOL_SUMMARY.get("endpoint_items", [])):
+        for candidate in ["D57", "D56", "D58"]:
+            if candidate in visits:
+                return candidate
+    return ""
+
+
 def build_unresolved_questions(field_mapping: list[dict[str, Any]], qc: dict[str, Any], subjects: list[dict[str, Any]], findings: list[dict[str, Any]]) -> str:
     unresolved = []
     unresolved.append("# 未解决数据问题\n")
@@ -3526,7 +3590,7 @@ function cellBadgeClass(text) {{
   if (/^未达到/.test(text)) return "watch";
   if (/≥50%|达到180|达到160|达到110|达到100|高风险|异常有临床意义|高/.test(text)) return "attn";
   if (/相近|更多但评估为异常无临床意义|中风险|低|Finding|AE/.test(text)) return "watch";
-  if (/EASI75|EASI90|IGA-TS|正常/.test(text)) return "good";
+  if (/正常|应答|改善|达标/.test(text)) return "good";
   return "info";
 }}
 function renderCell(header, value) {{
@@ -3540,7 +3604,7 @@ function renderCell(header, value) {{
 }}
 function efficacyHeaders(metric) {{
   const headers = ["访视编号","访视名称","日期","原始值","较基线变化","较基线百分比变化"];
-  if (["EASI","IGA","NRS","QSI-PROMIS睡眠相关影响8a","QSI-PROMIS睡眠困扰8b"].includes(metric)) {{
+  if (((DATA.protocol_summary || {{}}).response_rules || []).some(item => item.metric === metric)) {{
     headers.push("关键应答判定");
   }}
   headers.push("问题标记","关联Finding编号","数据来源sheet");
@@ -3644,6 +3708,10 @@ function renderTransferMarker(x, top, height, bottom, label) {{
   return `<line x1="${{x}}" y1="${{top}}" x2="${{x}}" y2="${{height-bottom}}" stroke="#b7b7b7" stroke-width="1.5" stroke-dasharray="6 5"></line>
     <text x="${{x}}" y="${{(top + 12).toFixed(1)}}" text-anchor="middle" font-size="10" fill="#8a8a8a">${{escapeHtml(label)}}</text>`;
 }}
+function isControlGroupText(text) {{
+  const value = String(text || "").toLowerCase();
+  return /对照组|安慰剂|placebo|control|comparator/.test(value);
+}}
 function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
   if (!shouldRenderSeriesChart(rows, seriesType, metricName) && rows.length && (seriesType === "lab" || seriesType === "vital")) {{
     return `<div class="summary-line">该指标当前按表格展示，不额外绘制历时变化图。</div>`;
@@ -3664,15 +3732,15 @@ function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
   const xPos = i => left + (numericRows.length === 1 ? plotW / 2 : (i / (numericRows.length - 1)) * plotW);
   const yPos = v => top + ((yMax - v) / (yMax - yMin)) * plotH;
   const path = numericRows.map((r, i) => `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["数值结果"])).toFixed(1)}}`).join(" ");
-  const transferIndex = chartOptions.showTransferLine ? numericRows.findIndex(r => r["访视编号"] === "D57") : -1;
+  const transferVisit = DATA.transfer_marker_visit || "";
+  const transferIndex = chartOptions.showTransferLine && transferVisit ? numericRows.findIndex(r => r["访视编号"] === transferVisit) : -1;
   const transferLine = transferIndex >= 0 ? renderTransferMarker(xPos(transferIndex).toFixed(1), top, height, bottom, "转组") : "";
   let marks = "";
   numericRows.forEach((r, i) => {{
     const abnormal = r["异常方向"] === "高" || r["异常方向"] === "低";
     const keyResponse = String(r["关键应答判定"] || "");
-    const isIgaTs = keyResponse.includes("IGA-TS");
-    const isEasi75 = keyResponse.includes("EASI-75");
-    const color = abnormal ? "#d4380d" : (isEasi75 || isIgaTs) ? "#1f6b30" : "#FF9900";
+    const hasResponse = !!keyResponse;
+    const color = abnormal ? "#d4380d" : hasResponse ? "#1f6b30" : "#FF9900";
     const cx = xPos(i).toFixed(1);
     const cy = yPos(Number(r["数值结果"])).toFixed(1);
     const tip = seriesType === "efficacy"
@@ -3683,9 +3751,8 @@ function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
       ? (metricName === "IGA" ? String(r["数值结果"] ?? "") : String(r["数值结果"] ?? r["原始值"] ?? ""))
       : r["结果值"];
     marks += `<text x="${{cx}}" y="${{(Number(cy)-10).toFixed(1)}}" text-anchor="middle" font-size="11" fill="${{color}}">${{escapeHtml(labelValue)}}</text>`;
-    if (seriesType === "efficacy" && (isEasi75 || isIgaTs)) {{
-      const responseLabel = isIgaTs ? "IGA-TS" : "EASI-75";
-      marks += `<text x="${{cx}}" y="${{(Number(cy)+16).toFixed(1)}}" text-anchor="middle" font-size="10" fill="#1f6b30">${{responseLabel}}</text>`;
+    if (seriesType === "efficacy" && hasResponse) {{
+      marks += `<text x="${{cx}}" y="${{(Number(cy)+16).toFixed(1)}}" text-anchor="middle" font-size="10" fill="#1f6b30">${{escapeHtml(keyResponse)}}</text>`;
     }}
     marks += `<text x="${{cx}}" y="${{height-34}}" text-anchor="middle" font-size="10" fill="#555">${{escapeHtml(r["访视编号"])}}</text>`;
     marks += `<text x="${{cx}}" y="${{height-20}}" text-anchor="middle" font-size="10" fill="#777">${{escapeHtml(r["日期"])}}</text>`;
@@ -3745,7 +3812,8 @@ function renderAggregateContinuousChart(rows, metricName) {{
   const yPos = v => top + ((yMax - v) / (yMax - yMin)) * plotH;
   const trialPath = rows.map((r, i) => Number.isNaN(Number(r["试验组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["试验组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
   const controlPath = rows.map((r, i) => Number.isNaN(Number(r["对照组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["对照组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
-  const transferIndex = rows.findIndex(r => r["访视编号"] === "D57");
+  const transferVisit = DATA.transfer_marker_visit || "";
+  const transferIndex = transferVisit ? rows.findIndex(r => r["访视编号"] === transferVisit) : -1;
   const transferLine = transferIndex >= 0 ? renderTransferMarker(xPos(transferIndex).toFixed(1), top, height, bottom, "转组") : "";
   let marks = "";
   rows.forEach((r, i) => {{
@@ -3801,7 +3869,8 @@ function renderAggregateBinaryChart(rows, responseName) {{
   const xPos = i => left + (i + 0.5) * (plotW / rows.length);
   const barW = Math.max(24, plotW / Math.max(rows.length * 2.2, 1));
   const yPos = v => top + ((100 - v) / 100) * plotH;
-  const transferIndex = rows.findIndex(r => r["访视编号"] === "D57");
+  const transferVisit = DATA.transfer_marker_visit || "";
+  const transferIndex = transferVisit ? rows.findIndex(r => r["访视编号"] === transferVisit) : -1;
   const transferLine = transferIndex >= 0 ? renderTransferMarker(xPos(transferIndex).toFixed(1), top, height, bottom, "转组") : "";
   let bars = "";
   rows.forEach((r, i) => {{
@@ -3965,7 +4034,7 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     const blocks = chosen.map(metric => {{
       const rows = subjectEfficacy.filter(r => r["指标名称"] === metric);
       const headers = efficacyHeaders(metric);
-      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "efficacy", {{ showTransferLine: String(subject["随机组别"] || "").includes("安慰剂") }})}}${{makeTable(headers, rows, `eff-${{subject["受试者编号"]}}-${{metric}}`)}}`;
+      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "efficacy", {{ showTransferLine: isControlGroupText(subject["随机组别"]) }})}}${{makeTable(headers, rows, `eff-${{subject["受试者编号"]}}-${{metric}}`)}}`;
     }}).join("");
     efficacySection = `<section><div class="module-title">疗效数据模块</div>${{blocks || "<div class='summary-line'>当前筛选下无疗效数据。</div>"}}</section>`;
   }}
@@ -3976,7 +4045,7 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     const blocks = chosen.map(metric => {{
       const rows = subjectLabs.filter(r => r["检验项目标准化名称"] === metric);
       const headers = ["实验室显示分组","访视编号","访视名称","日期","检验项目标准化名称","原始检验项目名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注","是否对应AE或Finding","数据来源sheet"];
-      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "lab", {{ showTransferLine: String(subject["随机组别"] || "").includes("安慰剂") }})}}${{makeTable(headers, rows, `lab-${{subject["受试者编号"]}}-${{metric}}`)}}`;
+      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "lab", {{ showTransferLine: isControlGroupText(subject["随机组别"]) }})}}${{makeTable(headers, rows, `lab-${{subject["受试者编号"]}}-${{metric}}`)}}`;
     }}).join("");
     labSection = `<section><div class="module-title">实验室检查数据模块</div>${{blocks || "<div class='summary-line'>当前筛选下无实验室数据。</div>"}}</section>`;
   }}
@@ -3987,7 +4056,7 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     const blocks = chosen.map(metric => {{
       const rows = subjectVitals.filter(r => r["生命体征指标"] === metric);
       const headers = ["访视编号","访视名称","日期","生命体征指标","原始指标名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注","是否对应AE或Finding","数据来源sheet"];
-      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "vital", {{ showTransferLine: String(subject["随机组别"] || "").includes("安慰剂") }})}}${{makeTable(headers, rows, `vital-${{subject["受试者编号"]}}-${{metric}}`)}}`;
+      return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "vital", {{ showTransferLine: isControlGroupText(subject["随机组别"]) }})}}${{makeTable(headers, rows, `vital-${{subject["受试者编号"]}}-${{metric}}`)}}`;
     }}).join("");
     vitalSection = `<section><div class="module-title">生命体征模块</div>${{blocks || "<div class='summary-line'>当前筛选下无生命体征数据。</div>"}}</section>`;
   }}
@@ -4120,6 +4189,7 @@ def build_payload() -> dict[str, Any]:
         "phase_field_labels": phase_field_labels,
         "subject_scope": SUBJECT_SCOPE,
         "include_usv": INCLUDE_USV,
+        "transfer_marker_visit": detect_transfer_marker_visit(),
         "subjects": subject_profiles,
         "efficacy": efficacy_rows,
         "labs": lab_rows,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -13,6 +14,10 @@ import openpyxl
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_patient_profile_html.py"
+SPEC = importlib.util.spec_from_file_location("build_patient_profile_html", SCRIPT_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(MODULE)
 
 
 def create_listing_workbook(path: Path) -> None:
@@ -232,6 +237,13 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.run_builder("--precheck-only")
         precheck = (self.output_dir / "input_precheck.md").read_text(encoding="utf-8")
         self.assertIn("[阻断] 方案文件", precheck)
+
+    def test_group_label_and_visit_name_are_generic(self) -> None:
+        self.assertEqual(MODULE.summary_group_label("试验组"), "试验组")
+        self.assertEqual(MODULE.summary_group_label("对照组"), "对照组")
+        self.assertEqual(MODULE.summary_group_label("placebo"), "对照组")
+        self.assertEqual(MODULE.simplify_visit_label("D29±1d", "双盲治疗期V5（D29±1d）"), "D29")
+        self.assertEqual(MODULE.simplify_visit_label("SCR", "筛选/导入期V1（D-7~D-1）"), "SCR")
 
 
 @unittest.skipUnless(os.environ.get("PATIENT_PROFILE_REAL_FIXTURE_DIR"), "Optional regression test requires PATIENT_PROFILE_REAL_FIXTURE_DIR")
