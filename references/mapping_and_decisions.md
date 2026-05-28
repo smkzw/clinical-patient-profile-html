@@ -5,7 +5,7 @@ Use this file when precheck shows `阻断` or `需确认`.
 ## Non-negotiable rules
 
 - Use subject-level listings and finding trackers as the primary source.
-- Use protocol/amendment files only for design, visit, endpoint, or window confirmation.
+- Use protocol/amendment files to identify efficacy endpoints first, including primary endpoints, secondary endpoints, and study-flow assessment timing.
 - If a field cannot be mapped confidently, mark it as unresolved and ask the user.
 - If a sheet should be excluded, get explicit user confirmation.
 - Keep the generated `suggested_project_config.json` as the first place to revise mappings. Do not edit Python unless the project structure falls outside the config model.
@@ -29,6 +29,10 @@ Use short, concrete questions.
 ### Missing efficacy sheet
 
 `未识别到 <metric> 的明确sheet。请确认该项目没有该指标，还是sheet名称不同；如名称不同，请提供正确sheet名。`
+
+### Endpoint variable type
+
+`方案中提到了 <metric>，但当前无法判断它应按连续型还是二分类展示。请确认该指标的展示口径。`
 
 ### Optional exclusion
 

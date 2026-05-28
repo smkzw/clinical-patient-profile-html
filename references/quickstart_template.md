@@ -1,6 +1,7 @@
 # Quickstart Template
 
 给其他同事直接复制用，先做预检查，再正式构建。
+注意：疗效指标的识别应先依据研究方案中的主次要终点和研究流程，不应默认沿用既往项目中的 EASI、IGA 等固定设置。
 
 ## 1. 预检查
 
@@ -17,6 +18,7 @@ python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_prof
 
 - `input_precheck.md`
 - `suggested_project_config.json`
+- `protocol_endpoint_summary.md`
 
 如果里面有 `阻断` 或 `需确认`，先补文件、确认字段映射，或明确哪些内容本轮不纳入。
 
@@ -39,10 +41,13 @@ python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_prof
 - `lab_longitudinal_dataset.csv`
 - `vital_signs_longitudinal_dataset.csv`
 - `finding_subject_level_dataset.csv`
+- `protocol_endpoint_summary.md`
 
 ## 常见情况
 
-- 缺少研究方案：可以先做 profile，但访视定义、终点定义、窗期解释要后补核对。
+- 缺少研究方案：当前 Skill 不应直接套用旧项目疗效口径，需先补研究方案，或人工明确本轮纳入哪些疗效指标。
 - 自动识别到多个中心：先明确本轮纳入哪些中心，再继续构建。
+- 方案里提到了终点，但 listing 里找不到对应 sheet：先确认该指标是否未导出，或决定本轮不纳入。
+- 方案中无法判断某疗效指标是连续型还是二分类：先由项目团队确认展示口径。
 - 某个指标的结果列或日期列没识别准：优先修改 `suggested_project_config.json`，不要先改 Python。
 - Finding sheet 找不到受试者字段：先让项目组确认该列，或决定该 sheet 暂不纳入。

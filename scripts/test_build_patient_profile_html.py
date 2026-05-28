@@ -101,6 +101,22 @@ def create_pd_definition_workbook(path: Path) -> None:
     wb.save(path)
 
 
+def create_protocol_text(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "研究方案",
+                "主要终点：第15天 EASI 评分较基线变化。",
+                "关键次要终点：第15天达到 EASI-75 的受试者比例。",
+                "次要终点：第15天 IGA 评分变化。",
+                "次要终点：第15天达到 IGA-TS 的受试者比例。",
+                "研究流程：筛选期、基线（D1）、第15天（D15）进行疗效评估。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 class BuildPatientProfileHtmlTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_root = Path(tempfile.mkdtemp(prefix="patient-profile-skill-", dir="/private/tmp"))
@@ -110,6 +126,7 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         create_listing_workbook(self.project_dir / "demo_listing.xlsx")
         create_finding_workbook(self.project_dir / "demo_finding.xlsx")
         create_pd_definition_workbook(self.project_dir / "demo_pd_definition.xlsx")
+        create_protocol_text(self.project_dir / "研究方案.txt")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_root, ignore_errors=True)
@@ -147,9 +164,13 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertTrue((self.output_dir / "input_precheck.md").exists())
         self.assertTrue((self.output_dir / "input_precheck.json").exists())
         self.assertTrue((self.output_dir / "suggested_project_config.json").exists())
+        self.assertTrue((self.output_dir / "protocol_endpoint_summary.md").exists())
         precheck = (self.output_dir / "input_precheck.md").read_text(encoding="utf-8")
         self.assertIn("可继续构建：是", precheck)
         self.assertIn("示例中心医院", precheck)
+        protocol_summary = (self.output_dir / "protocol_endpoint_summary.md").read_text(encoding="utf-8")
+        self.assertIn("EASI", protocol_summary)
+        self.assertIn("IGA", protocol_summary)
 
     def test_full_build_writes_expected_outputs(self) -> None:
         self.run_builder()
@@ -169,6 +190,10 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertIn("示例中心医院", html)
         self.assertIn("受试者Patient Profile", html)
         self.assertIn("疗效数据模块", html)
+        efficacy_csv = (self.output_dir / "efficacy_longitudinal_dataset.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("EASI", efficacy_csv)
+        self.assertIn("IGA", efficacy_csv)
+        self.assertNotIn("NRS", efficacy_csv)
 
     def test_build_with_generated_config(self) -> None:
         self.run_builder("--precheck-only")
@@ -193,6 +218,12 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         subprocess.run(cmd, check=True)
         self.assertTrue((second_dir / "patient_profile.html").exists())
         self.assertGreater(self.count_rows_from_dir(second_dir, "efficacy_longitudinal_dataset.csv"), 0)
+
+    def test_precheck_blocks_when_protocol_missing(self) -> None:
+        os.remove(self.project_dir / "研究方案.txt")
+        self.run_builder("--precheck-only")
+        precheck = (self.output_dir / "input_precheck.md").read_text(encoding="utf-8")
+        self.assertIn("[阻断] 方案文件", precheck)
 
 
 @unittest.skipUnless(os.environ.get("PATIENT_PROFILE_REAL_FIXTURE_DIR"), "Optional regression test requires PATIENT_PROFILE_REAL_FIXTURE_DIR")

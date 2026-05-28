@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import re
+import zipfile
 from copy import deepcopy
 from collections import Counter, defaultdict
 from datetime import date, datetime
@@ -13,6 +14,11 @@ from typing import Any
 
 import openpyxl
 import xlrd
+
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    PdfReader = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +34,7 @@ REF_HTMLS: list[Path] = []
 TARGET_CENTERS: list[str] = []
 PROTOCOL_FILES: list[Path] = []
 FINDING_SHEET_SPECS: list[dict[str, str]] = []
+PROTOCOL_SUMMARY: dict[str, Any] = {"files": [], "endpoint_items": [], "selected_metrics": [], "response_rules": [], "visit_mentions": []}
 MISSING_TEXT = "未在现有文件中确认"
 
 REQUIRED_LISTING_SHEETS = [
@@ -170,6 +177,25 @@ def detect_efficacy_config(path: Path) -> list[dict[str, Any]]:
     return configs
 
 
+def select_efficacy_config_by_protocol(
+    detected_efficacy: list[dict[str, Any]],
+    protocol_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_metrics = {item["metric"]: item for item in protocol_summary.get("selected_metrics", [])}
+    if not selected_metrics:
+        return []
+    selected_configs: list[dict[str, Any]] = []
+    for config in detected_efficacy:
+        selected = selected_metrics.get(config["metric"])
+        if not selected:
+            continue
+        resolved = deepcopy(config)
+        resolved["endpoint_role"] = selected.get("endpoint_role", "未分类")
+        resolved["variable_type"] = selected.get("variable_type", "continuous")
+        selected_configs.append(resolved)
+    return selected_configs
+
+
 def detect_lab_config(path: Path) -> list[dict[str, str]]:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -185,12 +211,136 @@ def detect_lab_config(path: Path) -> list[dict[str, str]]:
     return configs
 
 
+def normalize_protocol_text(text: str) -> str:
+    cleaned = text.replace("\u3000", " ")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+    return cleaned.strip()
+
+
+def read_protocol_file(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".txt":
+        return normalize_protocol_text(path.read_text(encoding="utf-8", errors="ignore"))
+    if suffix == ".docx":
+        with zipfile.ZipFile(path) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        text = re.sub(r"</w:p>", "\n", xml)
+        text = re.sub(r"<[^>]+>", "", text)
+        return normalize_protocol_text(text)
+    if suffix == ".pdf" and PdfReader is not None:
+        reader = PdfReader(str(path))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        return normalize_protocol_text(text)
+    return ""
+
+
+def classify_endpoint_role(line: str) -> str:
+    text = clean_text(line)
+    if any(token in text for token in ["主要终点", "主要疗效终点", "primary endpoint", "primary efficacy"]):
+        return "主要终点"
+    if any(token in text for token in ["关键次要终点", "key secondary", "key secondary endpoint"]):
+        return "关键次要终点"
+    if any(token in text for token in ["次要终点", "次要疗效终点", "secondary endpoint", "secondary efficacy"]):
+        return "次要终点"
+    if any(token in text for token in ["探索性终点", "exploratory endpoint"]):
+        return "探索性终点"
+    return "未分类"
+
+
+def classify_variable_type(endpoint_text: str) -> str:
+    text = clean_text(endpoint_text).lower()
+    if any(token in text for token in ["应答", "达标", "比例", "率", "proportion", "respond", "responder", "达到", "0/1", "75", "90", "50"]):
+        return "binary"
+    if any(token in text for token in ["变化", "change", "平均", "均值", "中位数", "评分", "score", "总分", "百分比变化", "reduction"]):
+        return "continuous"
+    return "需确认"
+
+
+def metric_matches_protocol(metric: str, line: str) -> bool:
+    text = clean_text(line)
+    if metric in text:
+        return True
+    metric_upper = metric.upper()
+    if metric_upper and metric_upper in text.upper():
+        return True
+    metric_alias_map = {
+        "EASI": ["湿疹面积及严重程度指数"],
+        "IGA": ["研究者整体评分", "vIGA-AD"],
+        "BSA": ["受累体表面积"],
+        "SCORAD": ["特应性皮炎评分"],
+        "DLQI": ["皮肤病生活质量指数"],
+        "CDLQI": ["儿童皮肤病生活质量指数"],
+        "NRS": ["Itch NRS", "瘙痒数值评定量表", "Pruritus NRS"],
+        "QSI-PROMIS睡眠相关影响8a": ["PROMIS", "睡眠相关影响8a"],
+        "QSI-PROMIS睡眠困扰8b": ["PROMIS", "睡眠困扰8b"],
+    }
+    return any(alias.lower() in text.lower() for alias in metric_alias_map.get(metric, []))
+
+
+def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_efficacy: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {"files": [str(path) for path in protocol_files], "endpoint_items": [], "selected_metrics": [], "response_rules": [], "visit_mentions": []}
+    if not protocol_files:
+        return summary
+
+    lines: list[str] = []
+    for path in protocol_files:
+        text = read_protocol_file(path)
+        if not text:
+            continue
+        lines.extend(line.strip() for line in text.splitlines() if clean_text(line))
+        summary["visit_mentions"].extend(sorted(set(re.findall(r"\b(?:D\d+|W\d+|Week\s*\d+|筛选期|基线|治疗结束)\b", text, flags=re.I))))
+
+    detected_metrics: dict[str, dict[str, Any]] = {}
+    response_rules: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        if not any(keyword in line for keyword in ["终点", "endpoint", "研究流程", "访视", "评估", "疗效"]):
+            continue
+        endpoint_role = classify_endpoint_role(line)
+        for item in detected_efficacy:
+            metric = item["metric"]
+            if not metric_matches_protocol(metric, line):
+                continue
+            variable_type = classify_variable_type(line)
+            existing = detected_metrics.get(metric)
+            if existing is None or existing["endpoint_role"] == "未分类":
+                detected_metrics[metric] = {
+                    "metric": metric,
+                    "endpoint_role": endpoint_role,
+                    "variable_type": variable_type if variable_type != "需确认" else item.get("default_variable_type", "continuous"),
+                    "source_excerpt": line[:220],
+                }
+            summary["endpoint_items"].append(
+                {
+                    "metric": metric,
+                    "endpoint_role": endpoint_role,
+                    "variable_type": variable_type,
+                    "source_excerpt": line[:220],
+                }
+            )
+        for rule in RESPONSE_RULE_CATALOG:
+            if any(re.search(pattern, line, re.I) for pattern in rule["patterns"]):
+                response_rules[rule["rule_key"]] = {
+                    "rule_key": rule["rule_key"],
+                    "metric": rule["metric"],
+                    "label": rule["label"],
+                    "endpoint_role": classify_endpoint_role(line),
+                    "variable_type": "binary",
+                    "source_excerpt": line[:220],
+                }
+
+    summary["selected_metrics"] = sorted(detected_metrics.values(), key=lambda item: efficacy_sort_key(item["metric"]))
+    summary["response_rules"] = sorted(response_rules.values(), key=lambda item: (efficacy_sort_key(item["metric"]), item["label"]))
+    return summary
+
+
 def build_suggested_project_config() -> dict[str, Any]:
     return {
         "project_name": WORK.name,
         "html_title": "受试者Patient Profile",
         "target_centers": TARGET_CENTERS[:],
         "sheet_aliases": SHEET_ALIASES.copy(),
+        "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
         "efficacy_config": deepcopy(EFFICACY_CONFIG),
         "lab_config": deepcopy(LAB_CONFIG),
         "finding_sheet_specs": deepcopy(FINDING_SHEET_SPECS),
@@ -200,11 +350,13 @@ def build_suggested_project_config() -> dict[str, Any]:
 
 
 def apply_project_config(config: dict[str, Any]) -> None:
-    global TARGET_CENTERS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, FINDING_SHEET_SPECS, HTML_TITLE
+    global TARGET_CENTERS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, FINDING_SHEET_SPECS, HTML_TITLE, PROTOCOL_SUMMARY
     if config.get("target_centers"):
         TARGET_CENTERS = [clean_text(item) for item in config.get("target_centers", []) if clean_text(item)]
     if config.get("sheet_aliases"):
         SHEET_ALIASES = {alias: clean_text(name) for alias, name in config["sheet_aliases"].items()}
+    if config.get("protocol_summary"):
+        PROTOCOL_SUMMARY = deepcopy(config["protocol_summary"])
     if config.get("efficacy_config"):
         EFFICACY_CONFIG = deepcopy(config["efficacy_config"])
     if config.get("lab_config"):
@@ -277,7 +429,7 @@ def detect_finding_sheet_specs(path: Path, candidate_centers: list[str]) -> list
 
 def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
     global WORK, OUTPUT_DIR, LISTING_XLSX, FINDING_XLSX, PD_DEF_XLSX, SUBJECT_REPORT_XLS, REF_HTMLS
-    global TARGET_CENTERS, PROTOCOL_FILES, FINDING_SHEET_SPECS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, HTML_TITLE
+    global TARGET_CENTERS, PROTOCOL_FILES, FINDING_SHEET_SPECS, SHEET_ALIASES, EFFICACY_CONFIG, LAB_CONFIG, HTML_TITLE, PROTOCOL_SUMMARY
 
     WORK = Path(args.work_dir).resolve()
     OUTPUT_DIR = Path(args.output_dir).resolve() if args.output_dir else (WORK / "patient_profile_output")
@@ -297,7 +449,9 @@ def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
     REF_HTMLS = ref_htmls
 
     SHEET_ALIASES = detect_sheet_aliases(LISTING_XLSX) if LISTING_XLSX.exists() else {alias: "" for alias in CORE_SHEET_CATALOG}
-    EFFICACY_CONFIG = detect_efficacy_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
+    detected_efficacy = detect_efficacy_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
+    PROTOCOL_SUMMARY = detect_protocol_endpoint_summary(PROTOCOL_FILES, detected_efficacy)
+    EFFICACY_CONFIG = select_efficacy_config_by_protocol(detected_efficacy, PROTOCOL_SUMMARY)
     LAB_CONFIG = detect_lab_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
     HTML_TITLE = "受试者Patient Profile"
 
@@ -322,6 +476,7 @@ def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
         "centers_from_user": bool(args.centers),
         "finding_sheet_specs": FINDING_SHEET_SPECS[:],
         "sheet_aliases": SHEET_ALIASES.copy(),
+        "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
         "efficacy_config": deepcopy(EFFICACY_CONFIG),
         "lab_config": deepcopy(LAB_CONFIG),
         "output_dir": str(OUTPUT_DIR),
@@ -500,6 +655,68 @@ DEFAULT_EFFICACY_CONFIG = [
     },
 ]
 
+RESPONSE_RULE_CATALOG = [
+    {
+        "rule_key": "EASI75",
+        "metric": "EASI",
+        "label": "EASI-75",
+        "patterns": [r"EASI[\s\-]?75", r"EASI.*75%"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "EASI90",
+        "metric": "EASI",
+        "label": "EASI-90",
+        "patterns": [r"EASI[\s\-]?90", r"EASI.*90%"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "IGA_TS",
+        "metric": "IGA",
+        "label": "IGA-TS",
+        "patterns": [r"IGA[\s\-]?TS", r"IGA.*0.?1.*改善.?2", r"vIGA.?AD 0.?1"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "IGA_01",
+        "metric": "IGA",
+        "label": "IGA 0/1分",
+        "patterns": [r"IGA.*0.?1", r"IGA 0/1", r"vIGA.?AD 0.?1"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "NRS4",
+        "metric": "NRS",
+        "label": "Itch NRS改善≥4分",
+        "patterns": [r"NRS.*改善.?≥?4", r"itch nrs.*4", r"pruritus nrs.*4"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "PROMIS8A_6",
+        "metric": "QSI-PROMIS睡眠相关影响8a",
+        "label": "PROMIS-8a临床意义改善",
+        "patterns": [r"PROMIS.*8a.*改善.?≥?6", r"睡眠相关影响8a.*改善.?≥?6", r"PROMIS.*8a"],
+        "variable_type": "binary",
+    },
+    {
+        "rule_key": "PROMIS8B_6",
+        "metric": "QSI-PROMIS睡眠困扰8b",
+        "label": "PROMIS-8b临床意义改善",
+        "patterns": [r"PROMIS.*8b.*改善.?≥?6", r"睡眠困扰8b.*改善.?≥?6", r"PROMIS.*8b"],
+        "variable_type": "binary",
+    },
+]
+
+ENDPOINT_METRIC_CATALOG = [
+    {
+        "metric": spec["metric"],
+        "aliases": [spec["metric"], *spec.get("sheet_patterns", [])],
+        "default_variable_type": "continuous",
+        "config": spec,
+    }
+    for spec in DEFAULT_EFFICACY_CONFIG
+]
+
 DEFAULT_LAB_CONFIG = [
     {"sheet": "LBHEMA--实验室检查-血常规", "sheet_patterns": [r"^LBHEMA--", r"血常规"], "lab_category": "血常规"},
     {"sheet": "LBCHEM--实验室检查-血生化", "sheet_patterns": [r"^LBCHEM--", r"血生化"], "lab_category": "血生化"},
@@ -547,15 +764,6 @@ VITAL_METRIC_ORDER = {
     "收缩压": 3,
     "舒张压": 4,
 }
-
-RESPONSE_ELIGIBLE_METRICS = {
-    "EASI",
-    "IGA",
-    "NRS",
-    "QSI-PROMIS睡眠相关影响8a",
-    "QSI-PROMIS睡眠困扰8b",
-}
-
 
 def clean_text(value: Any) -> str:
     if value is None:
@@ -885,15 +1093,17 @@ def response_label_matches(response_label: Any, response_name: str) -> bool:
     if not label or label == MISSING_TEXT:
         return False
     if response_name == "EASI-75":
-        return "EASI75" in label
+        return "EASI-75" in label
+    if response_name == "EASI-90":
+        return "EASI-90" in label
     if response_name == "IGA-TS":
         return "IGA-TS" in label
     if response_name == "IGA 0/1分":
-        return label in {"达到IGA 0/1分", "达到IGA 0/1分；IGA-TS"}
+        return "IGA 0/1分" in label
     if response_name == "Itch NRS改善≥4分":
         return label == "Itch NRS改善≥4分"
     if response_name in {"PROMIS-8a临床意义改善", "PROMIS-8b临床意义改善"}:
-        return label == "PROMIS临床意义改善"
+        return label == response_name
     return False
 
 
@@ -960,7 +1170,7 @@ def summary_group_label(group_name: Any) -> str:
 
 def should_assign_response_label(visit_id: str, visit_name: str, metric: str) -> bool:
     metric_name = clean_text(metric)
-    if metric_name not in RESPONSE_ELIGIBLE_METRICS:
+    if not selected_response_rules_for_metric(metric_name):
         return False
     visit_id_text = clean_text(visit_id).upper()
     visit_name_text = clean_text(visit_name)
@@ -971,7 +1181,7 @@ def should_assign_response_label(visit_id: str, visit_name: str, metric: str) ->
 
 def efficacy_table_headers(metric: str) -> list[str]:
     headers = ["访视编号", "访视名称", "日期", "原始值", "较基线变化", "较基线百分比变化"]
-    if clean_text(metric) in RESPONSE_ELIGIBLE_METRICS:
+    if selected_response_rules_for_metric(clean_text(metric)):
         headers.append("关键应答判定")
     headers.extend(["问题标记", "关联Finding编号", "数据来源sheet"])
     return headers
@@ -1386,18 +1596,16 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
             if not runtime.get("sheet_aliases", {}).get(alias):
                 issues.append({"级别": "阻断", "项目": "主listing", "说明": f"缺少关键sheet映射：{alias}", "建议": "请补充对应sheet，或明确替代sheet名称后再继续。"})
         if not runtime.get("efficacy_config"):
-            issues.append({"级别": "阻断", "项目": "疗效sheet", "说明": "未自动识别到任何可用疗效sheet。", "建议": "请确认疗效sheet名称，或说明该项目不纳入疗效profile。"})
+            issues.append({"级别": "阻断", "项目": "疗效终点识别", "说明": "未能基于方案主次要终点和研究流程识别出可纳入的疗效指标。", "建议": "请补充方案文件，或确认本轮需要纳入的疗效指标及其对应sheet。"})
         if not runtime.get("lab_config"):
             issues.append({"级别": "阻断", "项目": "实验室sheet", "说明": "未自动识别到任何可用实验室sheet。", "建议": "请确认实验室sheet名称，或说明该项目不纳入实验室profile。"})
-        detected_metrics = {item["metric"] for item in runtime.get("efficacy_config", [])}
-        for metric in ["EASI", "IGA", "NRS"]:
-            if metric not in detected_metrics:
-                issues.append({"级别": "需确认", "项目": "疗效sheet", "说明": f"未自动识别到 {metric} 对应sheet。", "建议": f"请确认该项目是否包含 {metric}；如包含，请提供正确sheet名或允许本轮不纳入。"})
         for item in runtime.get("efficacy_config", []):
             if not item.get("value_col_confirmed"):
                 issues.append({"级别": "需确认", "项目": "疗效字段映射", "说明": f"{item['metric']} 的数值列未能自动确认，当前拟用 {item['value_col']}。", "建议": "请确认结果值列名，或决定本轮不纳入该指标。"})
             if not item.get("date_col_confirmed"):
                 issues.append({"级别": "需确认", "项目": "疗效字段映射", "说明": f"{item['metric']} 的日期列未能自动确认，当前拟用 {item['date_col']}。", "建议": "请确认日期列名，或允许仅按访视顺序展示。"})
+            if item.get("variable_type") == "需确认":
+                issues.append({"级别": "需确认", "项目": "疗效变量类型", "说明": f"{item['metric']} 在方案终点描述中未能判断为连续型还是二分类。", "建议": "请确认该指标的变量类型及展示方式。"})
 
     if not FINDING_XLSX.exists():
         issues.append({"级别": "阻断", "项目": "Finding台账", "说明": "未识别到Finding台账文件，无法生成固定展示模块。", "建议": "请提供自查/稽查/Finding台账。"})
@@ -1420,7 +1628,9 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
         issues.append({"级别": "提示", "项目": "受试者报表", "说明": "未提供受试者报表，性别/年龄组/组别将仅依赖主listing。", "建议": "如需交叉核对DM与随机分组，建议补充受试者报表。"})
 
     if not PROTOCOL_FILES:
-        issues.append({"级别": "提示", "项目": "方案文件", "说明": "未识别到研究方案或勘误。", "建议": "如需核对访视定义、关键终点定义或窗期解释，建议补充方案文件。"})
+        issues.append({"级别": "阻断", "项目": "方案文件", "说明": "未识别到研究方案或勘误，无法基于主次要终点和研究流程确定疗效指标范围。", "建议": "请补充方案文件；如本轮允许手工指定疗效指标，请明确说明。"})
+    elif not runtime.get("protocol_summary", {}).get("selected_metrics"):
+        issues.append({"级别": "阻断", "项目": "方案终点解析", "说明": "已读取方案文件，但未从主次要终点或研究流程中识别出明确疗效指标。", "建议": "请确认方案文件内容可读，或手工指定需纳入的疗效指标。"})
 
     if not TARGET_CENTERS:
         issues.append({"级别": "阻断", "项目": "中心范围", "说明": "无法从主listing自动识别中心。", "建议": "请手动提供目标中心列表。"})
@@ -1446,6 +1656,8 @@ def write_precheck_outputs(precheck: dict[str, Any]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "input_precheck.json").write_text(json.dumps(precheck, ensure_ascii=False, indent=2), encoding="utf-8")
     (OUTPUT_DIR / "suggested_project_config.json").write_text(json.dumps(precheck["suggested_config"], ensure_ascii=False, indent=2), encoding="utf-8")
+    (OUTPUT_DIR / "protocol_endpoint_summary.json").write_text(json.dumps(precheck["runtime"].get("protocol_summary", {}), ensure_ascii=False, indent=2), encoding="utf-8")
+    (OUTPUT_DIR / "protocol_endpoint_summary.md").write_text(build_protocol_summary_markdown(precheck["runtime"].get("protocol_summary", {})), encoding="utf-8")
     lines = [
         "# Patient Profile 输入预检查",
         "",
@@ -1456,6 +1668,7 @@ def write_precheck_outputs(precheck: dict[str, Any]) -> None:
         f"- 方案偏离分类表：{precheck['runtime'].get('pd_def_xlsx') or MISSING_TEXT}",
         f"- 受试者报表：{precheck['runtime'].get('subject_report_xls') or MISSING_TEXT}",
         f"- 建议配置文件：{OUTPUT_DIR / 'suggested_project_config.json'}",
+        f"- 方案终点解构：{OUTPUT_DIR / 'protocol_endpoint_summary.md'}",
         "",
         "## 问题清单",
     ]
@@ -1670,22 +1883,35 @@ def build_ae_rows() -> list[dict[str, Any]]:
 def numeric_response_label(metric: str, baseline: float | None, current: float | None) -> str:
     if baseline is None or current is None:
         return MISSING_TEXT
+    selected_labels = {item["label"] for item in selected_response_rules_for_metric(metric)}
+    labels: list[str] = []
     if metric == "EASI":
         reduction = (baseline - current) / baseline * 100 if baseline else None
         if reduction is None:
             return MISSING_TEXT
-        labels = [label for threshold, label in [(90, "EASI90"), (75, "EASI75"), (50, "EASI50")] if reduction >= threshold]
-        return " / ".join(labels) if labels else "未达到EASI50"
+        threshold_map = [(90, "EASI-90"), (75, "EASI-75"), (50, "EASI-50")]
+        for threshold, label in threshold_map:
+            if label in selected_labels and reduction >= threshold:
+                labels.append(label)
+        return " / ".join(labels) if labels else MISSING_TEXT
     if metric == "IGA":
         if current in {0, 1}:
-            return "达到IGA 0/1分；IGA-TS" if (baseline - current) >= 2 else "达到IGA 0/1分"
-        return "未达到IGA 0/1分"
+            if "IGA-TS" in selected_labels and (baseline - current) >= 2:
+                labels.append("IGA-TS")
+            if "IGA 0/1分" in selected_labels:
+                labels.append("IGA 0/1分")
+        return "；".join(labels) if labels else MISSING_TEXT
     if metric == "NRS":
         diff = baseline - current
-        return "Itch NRS改善≥4分" if diff >= 4 else "未达到Itch NRS改善≥4分"
+        if "Itch NRS改善≥4分" in selected_labels and diff >= 4:
+            return "Itch NRS改善≥4分"
+        return MISSING_TEXT
     if metric in {"QSI-PROMIS睡眠相关影响8a", "QSI-PROMIS睡眠困扰8b"}:
         diff = baseline - current
-        return "PROMIS临床意义改善" if diff >= 6 else "未达到PROMIS临床意义改善"
+        label = "PROMIS-8a临床意义改善" if metric.endswith("8a") else "PROMIS-8b临床意义改善"
+        if label in selected_labels and diff >= 6:
+            return label
+        return MISSING_TEXT
     return MISSING_TEXT
 
 
@@ -2303,12 +2529,12 @@ def build_center_aggregate_payload(
     payload: dict[str, Any] = {}
     subject_group_map = {clean_text(row.get("受试者键")): clean_text(row.get("随机组别")) for row in subject_profiles}
     binary_configs = [
-        ("EASI", "EASI-75", lambda row: response_label_matches(row.get("关键应答判定"), "EASI-75")),
-        ("IGA", "IGA-TS", lambda row: response_label_matches(row.get("关键应答判定"), "IGA-TS")),
-        ("IGA", "IGA 0/1分", lambda row: response_label_matches(row.get("关键应答判定"), "IGA 0/1分")),
-        ("NRS", "Itch NRS改善≥4分", lambda row: response_label_matches(row.get("关键应答判定"), "Itch NRS改善≥4分")),
-        ("QSI-PROMIS睡眠相关影响8a", "PROMIS-8a临床意义改善", lambda row: response_label_matches(row.get("关键应答判定"), "PROMIS-8a临床意义改善")),
-        ("QSI-PROMIS睡眠困扰8b", "PROMIS-8b临床意义改善", lambda row: response_label_matches(row.get("关键应答判定"), "PROMIS-8b临床意义改善")),
+        (
+            item["metric"],
+            item["label"],
+            lambda row, response_name=item["label"]: response_label_matches(row.get("关键应答判定"), response_name),
+        )
+        for item in PROTOCOL_SUMMARY.get("response_rules", [])
     ]
     for center in TARGET_CENTERS:
         denominator_by_group = {
@@ -2316,6 +2542,7 @@ def build_center_aggregate_payload(
             "对照组": sum(1 for row in subject_profiles if clean_text(row.get("中心")) == center and clean_text(row.get("受试者状态")) != "筛选失败" and summary_group_label(row.get("随机组别")) == "对照组"),
         }
         efficacy_metrics = sorted({clean_text(row.get("指标名称")) for row in efficacy_rows if clean_text(row.get("中心")) == center}, key=efficacy_sort_key)
+        continuous_efficacy_metrics = [metric for metric in efficacy_metrics if selected_metric_variable_type(metric) != "binary"]
         lab_metrics = sorted(
             {
                 clean_text(row.get("检验项目标准化名称"))
@@ -2339,7 +2566,7 @@ def build_center_aggregate_payload(
                         denominator_by_group=denominator_by_group,
                     ),
                 }
-                for metric in efficacy_metrics
+                for metric in continuous_efficacy_metrics
             ],
             "efficacy_binary": [
                 {
@@ -2628,6 +2855,49 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({key: clean_text(value) for key, value in row.items()})
 
 
+def build_protocol_summary_markdown(protocol_summary: dict[str, Any]) -> str:
+    lines = ["# 方案终点与研究流程解构", ""]
+    files = protocol_summary.get("files", [])
+    lines.append("## 已读取方案文件")
+    if files:
+        for item in files:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 未读取到方案文件。")
+    lines.extend(["", "## 识别到的疗效指标"])
+    metrics = protocol_summary.get("selected_metrics", [])
+    if metrics:
+        for item in metrics:
+            lines.append(f"- {item['metric']}：{item.get('endpoint_role', '未分类')}；变量类型 {item.get('variable_type', '需确认')}。证据：{item.get('source_excerpt', '')}")
+    else:
+        lines.append("- 未识别到明确疗效指标。")
+    lines.extend(["", "## 识别到的二分类应答规则"])
+    response_rules = protocol_summary.get("response_rules", [])
+    if response_rules:
+        for item in response_rules:
+            lines.append(f"- {item['label']}（来源指标 {item['metric']}）：{item.get('endpoint_role', '未分类')}。证据：{item.get('source_excerpt', '')}")
+    else:
+        lines.append("- 未识别到明确的二分类应答规则。")
+    lines.extend(["", "## 研究流程表/访视提及"])
+    visit_mentions = protocol_summary.get("visit_mentions", [])
+    if visit_mentions:
+        lines.append(f"- {'；'.join(visit_mentions[:30])}")
+    else:
+        lines.append("- 未识别到明确访视提及。")
+    return "\n".join(lines) + "\n"
+
+
+def selected_response_rules_for_metric(metric: str) -> list[dict[str, Any]]:
+    return [item for item in PROTOCOL_SUMMARY.get("response_rules", []) if item.get("metric") == metric]
+
+
+def selected_metric_variable_type(metric: str) -> str:
+    for item in PROTOCOL_SUMMARY.get("selected_metrics", []):
+        if item.get("metric") == metric:
+            return item.get("variable_type", "continuous")
+    return "continuous"
+
+
 def build_unresolved_questions(field_mapping: list[dict[str, Any]], qc: dict[str, Any], subjects: list[dict[str, Any]], findings: list[dict[str, Any]]) -> str:
     unresolved = []
     unresolved.append("# 未解决数据问题\n")
@@ -2912,7 +3182,7 @@ function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
     const abnormal = r["异常方向"] === "高" || r["异常方向"] === "低";
     const keyResponse = String(r["关键应答判定"] || "");
     const isIgaTs = keyResponse.includes("IGA-TS");
-    const isEasi75 = keyResponse.includes("EASI75");
+    const isEasi75 = keyResponse.includes("EASI-75");
     const color = abnormal ? "#d4380d" : (isEasi75 || isIgaTs) ? "#1f6b30" : "#FF9900";
     const cx = xPos(i).toFixed(1);
     const cy = yPos(Number(r["数值结果"])).toFixed(1);
@@ -2943,7 +3213,7 @@ function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
     rangeLines += `<text x="${{left-6}}" y="${{(yPos(high)-4).toFixed(1)}}" text-anchor="end" font-size="11" fill="#9c7d18">ULN ${{high}}</text>`;
   }}
   const caption = seriesType === "efficacy"
-    ? "数据点已标注具体数值；EASI 达到 EASI-75 的点和 IGA 达到 IGA-TS 的点会额外标识。"
+    ? "数据点已标注具体数值；如该指标存在方案定义的关键应答，达到应答的点会额外标识。"
     : "数据点标注具体数值，X轴标注访视编号和对应日期；若仅有正常值下限或上限，则只绘制存在的一条参考线。";
   return `<div class="chart-box"><div><strong>${{escapeHtml(metricName)}}</strong></div>
     <svg viewBox="0 0 ${{width}} ${{height}}">
@@ -3357,6 +3627,7 @@ def build_payload() -> dict[str, Any]:
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "centers": TARGET_CENTERS,
+        "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
         "subjects": subject_profiles,
         "efficacy": efficacy_rows,
         "labs": lab_rows,
@@ -3393,6 +3664,8 @@ def main() -> None:
     write_csv(OUTPUT_DIR / "data_qc_summary.csv", payload["qc_summary"])
     write_csv(OUTPUT_DIR / "data_issue_log.csv", payload["issue_log"])
     write_csv(OUTPUT_DIR / "subject_data_completeness.csv", payload["completeness"])
+    (OUTPUT_DIR / "protocol_endpoint_summary.json").write_text(json.dumps(payload["protocol_summary"], ensure_ascii=False, indent=2), encoding="utf-8")
+    (OUTPUT_DIR / "protocol_endpoint_summary.md").write_text(build_protocol_summary_markdown(payload["protocol_summary"]), encoding="utf-8")
     (OUTPUT_DIR / "unresolved_data_questions.md").write_text(payload["unresolved_markdown"], encoding="utf-8")
     (OUTPUT_DIR / "patient_profile.html").write_text(render_html(payload), encoding="utf-8")
 

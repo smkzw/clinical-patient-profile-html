@@ -1,13 +1,13 @@
 ---
 name: clinical-patient-profile-html
-description: Trigger this skill when the user says “制作patient profile”, “patient profile”, “制作受试者画像”, “制作个例profile”, or asks to build subject-level or center-level clinical patient profile HTML from uploaded listings, protocol files, and finding trackers. The skill should automatically inspect the uploaded files, determine whether they are sufficient, ask only for blocking or ambiguous mappings, and otherwise proceed directly to generate an offline interactive Chinese HTML patient profile plus supporting CSV outputs.
+description: Trigger this skill when the user says “制作patient profile”, “patient profile”, “制作受试者画像”, “制作个例profile”, or asks to build subject-level or center-level clinical patient profile HTML from uploaded listings, protocol files, and finding trackers. The skill must read the protocol first, deconstruct primary and secondary endpoints plus the study flow table, decide which efficacy variables to include and whether they are continuous or binary, then inspect uploaded files, ask only for blocking or ambiguous mappings, and otherwise proceed directly to generate an offline interactive Chinese HTML patient profile plus supporting CSV outputs.
 ---
 
 # Clinical Patient Profile HTML
 
 Use this skill for clinical-study patient profile HTML work where the output must stay source-grounded and inspection-ready.
 
-This skill is best when the user provides subject listings, finding trackers, and optionally protocol/amendment files, and wants an offline HTML that combines subject profile, efficacy trends, lab trends, vital signs, and finding review.
+This skill is best when the user provides subject listings, protocol/amendment files, and finding trackers, and wants an offline HTML that combines subject profile, efficacy trends, lab trends, vital signs, and finding review.
 
 If the user explicitly says `制作patient profile` or an equivalent phrase after uploading files, invoke this skill immediately and start with file inspection rather than waiting for extra instructions.
 Do not require an additional “开始构建” instruction.
@@ -24,7 +24,10 @@ python3 scripts/build_patient_profile_html.py \
 ```
 
 2. Read `input_precheck.md`.
-Also inspect `suggested_project_config.json`.
+Also inspect:
+
+- `suggested_project_config.json`
+- `protocol_endpoint_summary.md`
 
 3. If precheck shows only `提示`, continue directly to full build.
 
@@ -49,11 +52,11 @@ Use `references/validation_checklist.md`.
 ## Required Inputs
 
 - A main listing workbook with subject-level tabs for demographics, randomization, visits, efficacy, labs, AE, and vital signs.
+- A protocol, amendment, or errata file that contains endpoint definitions and the study flow/assessment schedule.
 - A finding workbook or self-inspection/audit tracker.
 
 ## Optional Inputs
 
-- Protocol, amendment, or errata files for visit-window and endpoint-definition confirmation.
 - A subject report workbook for cross-checking sex, age group, and treatment assignment.
 - Reference HTML files if the project already has an approved patient-profile style to follow.
 
@@ -62,6 +65,9 @@ Use `references/validation_checklist.md`.
 Ask the user instead of proceeding when any of these happen:
 
 - More than one center is detected and the target center scope is not explicitly stated.
+- The protocol is missing or unreadable.
+- The protocol does not yield a clear endpoint-to-metric mapping.
+- The protocol does not make it clear whether an efficacy variable is continuous or binary.
 - The finding workbook exists but the relevant sheet or subject column cannot be confirmed.
 - Key efficacy sheets are missing or likely renamed.
 - Lab reference ranges are absent and the user must decide whether to keep those rows with blank normal-range display.
@@ -73,13 +79,14 @@ Use the prompt patterns in `references/mapping_and_decisions.md`.
 
 ## Adaptation Rules
 
-This skill ships with a working builder that already reproduces the current RUX patient-profile style and logic closely. For a structurally similar project, prefer changing configuration and mapping before changing rendering.
+This skill ships with a working builder that reproduces the current patient-profile style closely, but efficacy identification must be protocol-driven rather than copied from a prior project.
 
 Prefer updating `suggested_project_config.json` before editing Python.
 
 Adjust the script only in these places when the new project differs beyond config:
 
-- `EFFICACY_CONFIG` for efficacy sheet names and value columns
+- protocol parsing and endpoint extraction logic
+- `EFFICACY_CONFIG` for candidate efficacy sheet names and value columns
 - `LAB_CONFIG` for lab workbook tabs
 - `CORE_SHEET_CATALOG` for nonstandard main listing tabs
 - `FINDING_SHEET_SPECS` or finding-sheet auto-detection behavior
@@ -104,6 +111,8 @@ The builder writes at least these files to the chosen output directory:
 - `unresolved_data_questions.md`
 - `input_precheck.md`
 - `input_precheck.json`
+- `protocol_endpoint_summary.md`
+- `protocol_endpoint_summary.json`
 
 The output HTML must stay Chinese-first in title, labels, filters, tables, and review text, consistent with the prior RUX patient-profile style.
 
