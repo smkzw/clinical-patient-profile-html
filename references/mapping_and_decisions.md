@@ -26,6 +26,10 @@ Use short, concrete questions.
 
 `请确认是否纳入USV/计划外访视数据。若纳入，仅在个例层面展示，并按USV实际日期放入历时图表。`
 
+### Baseline rule
+
+`方案提示筛选期近D1的数据可能作为基线，但当前无法自动确认中心层是否应将 SCR/D1 合并为“基线”。请确认 <实验室/心电图/生命体征> 的中心层展示口径，以及个例层基线比较应采用哪个访视值。`
+
 ### Main listing workbook
 
 `当前目录识别到多个可能的主listing文件。请确认以哪一个作为主数据源：<file list>？`
@@ -49,6 +53,10 @@ Use short, concrete questions.
 ### Protocol-required assessment missing
 
 `研究流程表提示需要收集 <assessment>，但当前listing中未识别到对应数据。请指出该数据位于哪个sheet，或明确本轮不纳入。`
+
+### Early-exit visit
+
+`方案和listing均识别到提前退出访视。请确认是否按默认规则处理：中心层图中不绘制该访视、表格最后一行保留；个例层按最后一个访视点展示。`
 
 ### Optional exclusion
 

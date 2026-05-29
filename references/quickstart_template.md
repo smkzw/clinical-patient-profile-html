@@ -51,7 +51,9 @@ python3 ~/.codex/skills/clinical-patient-profile-html/scripts/build_patient_prof
 
 - 缺少研究方案：当前 Skill 不应直接套用旧项目疗效口径，需先补研究方案，或人工明确本轮纳入哪些疗效指标。
 - 自动识别到多个中心：先明确本轮纳入哪些中心，再继续构建。
+- 方案里写了筛选期结果可作为基线，但程序没有自动判清：先确认实验室 / 心电图 / 生命体征在中心层是否将 SCR / D1 合并展示为“基线”。
 - 方案里提到了终点，但 listing 里找不到对应 sheet：先确认该指标是否未导出，或决定本轮不纳入。
 - 方案中无法判断某疗效指标是连续型还是二分类：先由项目团队确认展示口径。
 - 某个指标的结果列或日期列没识别准：优先修改 `suggested_project_config.json`，不要先改 Python。
 - Finding sheet 找不到受试者字段：先让项目组确认该列，或决定该 sheet 暂不纳入。
+- 本轮没有 Finding 文件：可以继续构建，但不会生成 Finding 固定展示模块，也不会做个例层 Finding 关联标注。

@@ -224,6 +224,8 @@ def simplify_visit_label(visit_id: Any, raw_name: Any = "") -> str:
         return "USV"
     if code in {"COMMON"} or "共同页" in raw:
         return "COMMON"
+    if code in {"EOS", "EE", "EXIT"} or "提前退出" in raw or "早退" in raw:
+        return "提前退出"
     if code in {"EOT", "EOS"}:
         return code
     match = re.search(r"D-?\d+", code, re.I) or re.search(r"D-?\d+", raw, re.I)
@@ -239,6 +241,10 @@ def phase_visit_sort_key(visit_id: str, date_text: str) -> tuple[int, int, str]:
     visit = clean_text(visit_id)
     if visit == "SCR":
         return (0, -7, visit)
+    if visit in {"EOS", "EE", "EXIT", "提前退出"}:
+        return (8, 9998, visit)
+    if visit == "EOT":
+        return (8, 9997, visit)
     match = re.search(r"D(-?\d+)", visit)
     if match:
         return (1, int(match.group(1)), visit)
@@ -246,6 +252,55 @@ def phase_visit_sort_key(visit_id: str, date_text: str) -> tuple[int, int, str]:
     if match:
         return (2, int(match.group(1)) * 7, visit)
     return (9, 9999, clean_text(date_text) or visit)
+
+
+def is_early_exit_visit(visit_id: Any, visit_name: Any) -> bool:
+    visit_code = clean_text(visit_id).upper()
+    visit_label = clean_text(visit_name)
+    return visit_code in {"EOS", "EE", "EXIT"} or "提前退出" in visit_label or "早退" in visit_label
+
+
+def has_finding_data() -> bool:
+    return bool(FINDING_XLSX.exists() and FINDING_SHEET_SPECS)
+
+
+def baseline_rule_for(category: str) -> dict[str, Any]:
+    return deepcopy((PROTOCOL_SUMMARY.get("baseline_rules") or {}).get(category, {}))
+
+
+def should_merge_center_baseline(category: str) -> bool:
+    return bool(baseline_rule_for(category).get("center_summary_merge"))
+
+
+def normalize_center_summary_visit(row: dict[str, Any], category: str) -> tuple[str, str, bool]:
+    visit_id = clean_text(row.get("访视编号"))
+    visit_name = clean_text(row.get("访视名称"))
+    if should_merge_center_baseline(category) and visit_id in {"SCR", "D1"}:
+        return ("基线", "基线", False)
+    if is_early_exit_visit(visit_id, visit_name):
+        return ("提前退出", "提前退出", True)
+    return (visit_id, visit_name, False)
+
+
+def select_subject_baseline_row(metric_rows: list[dict[str, Any]], category: str) -> dict[str, Any] | None:
+    if not metric_rows:
+        return None
+    rows_sorted = sorted(
+        metric_rows,
+        key=lambda x: (
+            clean_text(x.get("日期")) == MISSING_TEXT,
+            clean_text(x.get("日期")),
+            phase_visit_sort_key(clean_text(x.get("访视编号")), clean_text(x.get("日期"))),
+        ),
+    )
+    d1_row = next((row for row in rows_sorted if clean_text(row.get("访视编号")) == "D1"), None)
+    if d1_row is not None:
+        return d1_row
+    if baseline_rule_for(category).get("subject_baseline_fallback_scr"):
+        scr_rows = [row for row in rows_sorted if clean_text(row.get("访视编号")) == "SCR"]
+        if scr_rows:
+            return sorted(scr_rows, key=lambda x: clean_text(x.get("日期")) or "")[-1]
+    return rows_sorted[0]
 
 
 def detect_sheet_aliases(path: Path) -> dict[str, str]:
@@ -386,6 +441,104 @@ def metric_matches_protocol(metric: str, line: str) -> bool:
     return any(clean_text(alias).lower() in text.lower() for alias in aliases if clean_text(alias))
 
 
+def normalize_phase_name(text: str) -> str:
+    phase = clean_text(text)
+    phase = re.sub(r"^(在|于|及|或者|完善|若|可接受|从)", "", phase)
+    return phase
+
+
+def is_plausible_phase_name(text: str) -> bool:
+    phase = normalize_phase_name(text)
+    if not phase or len(phase) > 20:
+        return False
+    if phase in {"版本号/日期", "版本号/版本日期", "视期", "研究期"}:
+        return False
+    if "退出" in phase:
+        return True
+    if not phase.endswith("期"):
+        return False
+    return any(token in phase for token in ["筛选", "导入", "治疗", "随访", "观察", "维持", "开放", "双盲", "单盲", "安全", "基线", "研究结束"])
+
+
+def detect_protocol_baseline_rules(lines: list[str], required_assessments: set[str]) -> dict[str, Any]:
+    rules: dict[str, Any] = {}
+    normalized_pairs = [(line, re.sub(r"\s+", "", line)) for line in lines]
+    lab_evidence = next(
+        (
+            raw
+            for raw, normalized in normalized_pairs
+            if any(token in normalized for token in ["W0", "D1", "给药前"])
+            and any(token in normalized for token in ["可接受", "可使用"])
+            and any(token in normalized for token in ["7天内", "7日内"])
+            and any(token in normalized for token in ["实验室", "血常规", "血生化", "尿常规", "血清", "尿蛋白"])
+        ),
+        "",
+    )
+    if lab_evidence:
+        rules["实验室"] = {
+            "center_summary_merge": True,
+            "subject_baseline_fallback_scr": True,
+            "evidence": clean_text(lab_evidence)[:220],
+            "status": "confirmed",
+        }
+    elif "实验室" in required_assessments:
+        rules["实验室"] = {"center_summary_merge": False, "subject_baseline_fallback_scr": False, "status": "unclear"}
+
+    ecg_evidence = next(
+        (
+            raw
+            for raw, normalized in normalized_pairs
+            if any(token in normalized for token in ["W0", "D1", "给药前"])
+            and any(token in normalized for token in ["可接受", "可使用"])
+            and any(token in normalized for token in ["7天内", "7日内"])
+            and any(token in normalized for token in ["心电图", "QTc", "QTcF", "12导联"])
+        ),
+        "",
+    )
+    if ecg_evidence:
+        rules["心电图"] = {
+            "center_summary_merge": True,
+            "subject_baseline_fallback_scr": True,
+            "evidence": clean_text(ecg_evidence)[:220],
+            "status": "confirmed",
+        }
+    elif "心电图" in required_assessments:
+        rules["心电图"] = {"center_summary_merge": False, "subject_baseline_fallback_scr": False, "status": "unclear"}
+
+    vital_evidence = next(
+        (
+            raw
+            for raw, normalized in normalized_pairs
+            if any(token in normalized for token in ["W0", "D1", "给药前"])
+            and any(token in normalized for token in ["可接受", "可使用"])
+            and any(token in normalized for token in ["7天内", "7日内"])
+            and any(token in normalized for token in ["生命体征", "体格检查"])
+        ),
+        "",
+    )
+    if vital_evidence:
+        rules["生命体征"] = {
+            "center_summary_merge": True,
+            "subject_baseline_fallback_scr": True,
+            "evidence": clean_text(vital_evidence)[:220],
+            "status": "confirmed",
+        }
+    elif "生命体征" in required_assessments:
+        rules["生命体征"] = {"center_summary_merge": False, "subject_baseline_fallback_scr": False, "status": "unclear"}
+
+    phase_candidates: list[str] = []
+    for line in lines:
+        if "V" not in line and "访视" not in line:
+            continue
+        for match in re.finditer(r"((?:[^ \t，。；:：]{1,20}?期|提前退出))", line):
+            phase = normalize_phase_name(match.group(1))
+            if is_plausible_phase_name(phase):
+                phase_candidates.append(phase)
+    rules["phase_candidates"] = unique(phase_candidates)
+    rules["has_early_exit"] = any("提前退出" in clean_text(line) or "早退" in clean_text(line) for line in lines)
+    return rules
+
+
 def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_efficacy: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {
         "files": [str(path) for path in protocol_files],
@@ -395,6 +548,7 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
         "visit_mentions": [],
         "study_phases": [],
         "required_assessments": [],
+        "baseline_rules": {},
     }
     if not protocol_files:
         return summary
@@ -409,8 +563,6 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
             continue
         lines.extend(line.strip() for line in text.splitlines() if clean_text(line))
         summary["visit_mentions"].extend(sorted(set(re.findall(r"\b(?:D-?\d+(?:~D-?\d+)?(?:±\d+d)?|W\d+|Week\s*\d+|筛选期|基线|治疗结束|安全性随访期)\b", text, flags=re.I))))
-        for match in re.finditer(r"((?:筛选/?导入期|双盲治疗期|开放(?:标签)?治疗期|安全性随访期|随访期|治疗结束期))", text):
-            phase_set.add(clean_text(match.group(1)))
         if any(token in text for token in ["实验室", "血常规", "血生化", "尿常规"]):
             assessment_set.add("实验室")
         if "生命体征" in text:
@@ -461,6 +613,12 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
                     "source_excerpt": line[:220],
                 }
 
+    baseline_rules = detect_protocol_baseline_rules(lines, assessment_set)
+    for phase in baseline_rules.pop("phase_candidates", []):
+        phase_set.add(phase)
+    if baseline_rules.get("has_early_exit"):
+        phase_set.add("提前退出")
+
     summary["selected_metrics"] = sorted(detected_metrics.values(), key=lambda item: efficacy_sort_key(item["metric"]))
     summary["response_rules"] = sorted(response_rules.values(), key=lambda item: (efficacy_sort_key(item["metric"]), item["label"]))
     summary["visit_mentions"] = sorted(unique(summary["visit_mentions"]))
@@ -468,6 +626,7 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
         phase_set.discard("随访期")
     summary["study_phases"] = sorted(phase_set)
     summary["required_assessments"] = sorted(assessment_set)
+    summary["baseline_rules"] = baseline_rules
     return summary
 
 
@@ -1274,27 +1433,31 @@ def aggregate_continuous_by_visit_group(
     subject_group_map: dict[str, str],
     denominator_by_group: dict[str, int],
     value_key: str = "数值结果",
+    summary_category: str = "",
 ) -> list[dict[str, Any]]:
     filtered = [
         row for row in rows
         if clean_text(row.get("中心")) == clean_text(center)
         and clean_text(row.get(metric_key)) == clean_text(metric_value)
         and isinstance(row.get(value_key), (int, float))
-        and not is_excluded_center_summary_visit(row.get("访视编号"), row.get("访视名称"))
+        and not is_unplanned_visit(row.get("访视编号"), row.get("访视名称"))
+        and not (clean_text(row.get("访视编号")).upper() == "EOT" or "治疗结束" in clean_text(row.get("访视名称")))
     ]
-    grouped: defaultdict[tuple[str, str], dict[str, list[float]]] = defaultdict(lambda: {"试验组": [], "对照组": []})
+    grouped: defaultdict[tuple[str, str, bool], dict[str, list[float]]] = defaultdict(lambda: {"试验组": [], "对照组": []})
     date_by_group: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
     for row in filtered:
         group = summary_group_label(subject_group_map.get(clean_text(row.get("受试者键")), ""))
         if not group:
             continue
-        key = (clean_text(row.get("访视编号")), clean_text(row.get("访视名称")))
+        visit_id, visit_name, chart_exclude = normalize_center_summary_visit(row, summary_category)
+        key = (visit_id, visit_name, chart_exclude)
         grouped[key][group].append(float(row[value_key]))
         if clean_text(row.get("日期")):
-            date_by_group[key].append(clean_text(row.get("日期")))
+            date_by_group[(visit_id, visit_name)].append(clean_text(row.get("日期")))
     summary_rows: list[dict[str, Any]] = []
     for key, values_by_group in grouped.items():
-        unique_dates = sorted(set(date_by_group.get(key, [])))
+        visit_id, visit_name, chart_exclude = key
+        unique_dates = sorted(set(date_by_group.get((visit_id, visit_name), [])))
         if not unique_dates:
             date_label = MISSING_TEXT
         elif len(unique_dates) == 1:
@@ -1304,9 +1467,10 @@ def aggregate_continuous_by_visit_group(
         row: dict[str, Any] = {
             "中心": center,
             "指标名称": clean_text(metric_value),
-            "访视编号": key[0],
-            "访视名称": key[1],
+            "访视编号": visit_id,
+            "访视名称": visit_name,
             "日期": date_label,
+            "中心汇总图排除": "是" if chart_exclude else "否",
         }
         for group in ["试验组", "对照组"]:
             values = values_by_group[group]
@@ -1322,7 +1486,14 @@ def aggregate_continuous_by_visit_group(
             row[f"{prefix}均值数值"] = compute_mean(values)
             row[f"{prefix}标准差数值"] = compute_sample_sd(values)
         summary_rows.append(row)
-    return sorted(summary_rows, key=lambda row: (row["日期"] == MISSING_TEXT, row["日期"], row["访视编号"]))
+    return sorted(
+        summary_rows,
+        key=lambda row: (
+            row.get("中心汇总图排除") == "是",
+            phase_visit_sort_key(clean_text(row.get("访视编号")), clean_text(row.get("日期"))),
+            clean_text(row.get("日期")),
+        ),
+    )
 
 
 def aggregate_binary_by_visit_group(
@@ -1340,21 +1511,24 @@ def aggregate_binary_by_visit_group(
         if clean_text(row.get("中心")) == clean_text(center)
         and clean_text(row.get(metric_key)) == clean_text(metric_value)
         and clean_text(row.get("关键应答判定")) not in {"", MISSING_TEXT}
-        and not is_excluded_center_summary_visit(row.get("访视编号"), row.get("访视名称"))
+        and not is_unplanned_visit(row.get("访视编号"), row.get("访视名称"))
+        and not (clean_text(row.get("访视编号")).upper() == "EOT" or "治疗结束" in clean_text(row.get("访视名称")))
     ]
-    grouped: defaultdict[tuple[str, str], dict[str, list[dict[str, Any]]]] = defaultdict(lambda: {"试验组": [], "对照组": []})
+    grouped: defaultdict[tuple[str, str, bool], dict[str, list[dict[str, Any]]]] = defaultdict(lambda: {"试验组": [], "对照组": []})
     date_by_group: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
     for row in filtered:
         group = summary_group_label(subject_group_map.get(clean_text(row.get("受试者键")), ""))
         if not group:
             continue
-        key = (clean_text(row.get("访视编号")), clean_text(row.get("访视名称")))
+        visit_id, visit_name, chart_exclude = normalize_center_summary_visit(row, "疗效")
+        key = (visit_id, visit_name, chart_exclude)
         grouped[key][group].append(row)
         if clean_text(row.get("日期")):
-            date_by_group[key].append(clean_text(row.get("日期")))
+            date_by_group[(visit_id, visit_name)].append(clean_text(row.get("日期")))
     summary_rows: list[dict[str, Any]] = []
     for key, rows_by_group in grouped.items():
-        unique_dates = sorted(set(date_by_group.get(key, [])))
+        visit_id, visit_name, chart_exclude = key
+        unique_dates = sorted(set(date_by_group.get((visit_id, visit_name), [])))
         if not unique_dates:
             date_label = MISSING_TEXT
         elif len(unique_dates) == 1:
@@ -1365,9 +1539,10 @@ def aggregate_binary_by_visit_group(
             "中心": center,
             "指标名称": clean_text(metric_value),
             "应答名称": response_name,
-            "访视编号": key[0],
-            "访视名称": key[1],
+            "访视编号": visit_id,
+            "访视名称": visit_name,
             "日期": date_label,
+            "中心汇总图排除": "是" if chart_exclude else "否",
         }
         for group in ["试验组", "对照组"]:
             visit_rows = rows_by_group[group]
@@ -1381,7 +1556,14 @@ def aggregate_binary_by_visit_group(
             row[f"{prefix}应答比例"] = format_number(proportion) + "%" if proportion is not None else ""
             row[f"{prefix}应答比例数值"] = proportion
         summary_rows.append(row)
-    return sorted(summary_rows, key=lambda row: (row["日期"] == MISSING_TEXT, row["日期"], row["访视编号"]))
+    return sorted(
+        summary_rows,
+        key=lambda row: (
+            row.get("中心汇总图排除") == "是",
+            phase_visit_sort_key(clean_text(row.get("访视编号")), clean_text(row.get("日期"))),
+            clean_text(row.get("日期")),
+        ),
+    )
 
 
 def response_label_matches(response_label: Any, response_name: str) -> bool:
@@ -1452,7 +1634,7 @@ def is_unplanned_visit(visit_id: Any, visit_name: Any) -> bool:
 def is_excluded_center_summary_visit(visit_id: Any, visit_name: Any) -> bool:
     visit_code = clean_text(visit_id).upper()
     visit_label = clean_text(visit_name)
-    return is_unplanned_visit(visit_id, visit_name) or visit_code == "EOT" or "治疗结束" in visit_label
+    return is_unplanned_visit(visit_id, visit_name) or is_early_exit_visit(visit_id, visit_name) or visit_code == "EOT" or "治疗结束" in visit_label
 
 
 def summary_group_label(group_name: Any) -> str:
@@ -1480,7 +1662,10 @@ def efficacy_table_headers(metric: str) -> list[str]:
     headers = ["访视编号", "访视名称", "日期", "原始值", "较基线变化", "较基线百分比变化"]
     if selected_response_rules_for_metric(clean_text(metric)):
         headers.append("关键应答判定")
-    headers.extend(["问题标记", "关联Finding编号", "数据来源sheet"])
+    headers.append("问题标记")
+    if has_finding_data():
+        headers.append("关联Finding编号")
+    headers.append("数据来源sheet")
     return headers
 
 
@@ -1577,8 +1762,8 @@ def lab_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
         LAB_CATEGORY_ORDER.get(group, 99),
         LAB_METRIC_ORDER.get(metric, 999),
         metric,
+        phase_visit_sort_key(clean_text(row.get("访视编号")), clean_text(row.get("日期"))),
         clean_text(row.get("日期")),
-        clean_text(row.get("访视编号")),
     )
 
 
@@ -1589,8 +1774,8 @@ def vital_sort_row_key(row: dict[str, Any]) -> tuple[Any, ...]:
         clean_text(row.get("受试者编号")),
         VITAL_METRIC_ORDER.get(metric, 999),
         metric,
+        phase_visit_sort_key(clean_text(row.get("访视编号")), clean_text(row.get("日期"))),
         clean_text(row.get("日期")),
-        clean_text(row.get("访视编号")),
     )
 
 
@@ -1931,6 +2116,7 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
     issues: list[dict[str, str]] = []
     workbook_inventory: dict[str, list[dict[str, Any]]] = {}
     suggested_config = build_suggested_project_config()
+    required_assessments = set(runtime.get("protocol_summary", {}).get("required_assessments", []))
 
     if not LISTING_XLSX.exists():
         issues.append({"级别": "阻断", "项目": "主listing", "说明": "未识别到主listing文件，无法继续。", "建议": "请提供受试者级listing或明确文件路径。"})
@@ -1951,7 +2137,6 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
                 issues.append({"级别": "需确认", "项目": "疗效字段映射", "说明": f"{item['metric']} 的日期列未能自动确认，当前拟用 {item['date_col']}。", "建议": "请确认日期列名，或允许仅按访视顺序展示。"})
             if item.get("variable_type") == "需确认":
                 issues.append({"级别": "需确认", "项目": "疗效变量类型", "说明": f"{item['metric']} 在方案终点描述中未能判断为连续型还是二分类。", "建议": "请确认该指标的变量类型及展示方式。"})
-        required_assessments = set(runtime.get("protocol_summary", {}).get("required_assessments", []))
         if "实验室" in required_assessments and not runtime.get("lab_config"):
             issues.append({"级别": "阻断", "项目": "实验室检查", "说明": "方案/研究流程提示需收集实验室检查，但listing中未识别到可用实验室sheet。", "建议": "请指出实验室数据位于哪个listing的哪个sheet。"})
         if "生命体征" in required_assessments and not runtime.get("sheet_aliases", {}).get("VS"):
@@ -1960,12 +2145,12 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
             issues.append({"级别": "阻断", "项目": "心电图", "说明": "方案/研究流程提示需收集心电图，但listing中未识别到心电图sheet。", "建议": "请指出心电图位于哪个listing的哪个sheet。"})
 
     if not FINDING_XLSX.exists():
-        issues.append({"级别": "阻断", "项目": "Finding台账", "说明": "未识别到Finding台账文件，无法生成固定展示模块。", "建议": "请提供自查/稽查/Finding台账。"})
+        issues.append({"级别": "提示", "项目": "Finding台账", "说明": "未识别到Finding台账文件，本轮将不生成Finding固定展示模块，也不会在个例层面标注关联Finding。", "建议": "如本轮仅需疗效/安全性profile，可继续；如需受试者级Finding联动，请补充Finding台账。"})
     else:
         finding_specs = scan_workbook_structure(FINDING_XLSX, listing_mode=False)
         workbook_inventory["finding"] = finding_specs
         if not FINDING_SHEET_SPECS:
-            issues.append({"级别": "阻断", "项目": "Finding台账", "说明": "已找到Finding工作簿，但无法自动定位Finding sheet或受试者字段。", "建议": "请指定Finding sheet、中心对应关系和受试者字段。"})
+            issues.append({"级别": "需确认", "项目": "Finding台账", "说明": "已找到Finding工作簿，但无法自动定位Finding sheet或受试者字段。", "建议": "请指定Finding sheet、中心对应关系和受试者字段；若本轮不纳入Finding，请明确说明。"})
         else:
             for spec in FINDING_SHEET_SPECS:
                 if spec["center"] == MISSING_TEXT or spec["subject_col"] == MISSING_TEXT:
@@ -1983,6 +2168,17 @@ def build_precheck_summary(runtime: dict[str, Any]) -> dict[str, Any]:
         issues.append({"级别": "阻断", "项目": "方案文件", "说明": "未识别到研究方案或勘误，无法基于主次要终点和研究流程确定疗效指标范围。", "建议": "请补充方案文件；如本轮允许手工指定疗效指标，请明确说明。"})
     elif not runtime.get("protocol_summary", {}).get("selected_metrics"):
         issues.append({"级别": "阻断", "项目": "方案终点解析", "说明": "已读取方案文件，但未从主次要终点或研究流程中识别出明确疗效指标。", "建议": "请确认方案文件内容可读，或手工指定需纳入的疗效指标。"})
+
+    baseline_rules = runtime.get("protocol_summary", {}).get("baseline_rules", {})
+    for category in ["实验室", "心电图", "生命体征"]:
+        rule = baseline_rules.get(category, {})
+        if rule.get("status") == "unclear" and category in required_assessments:
+            issues.append({
+                "级别": "需确认",
+                "项目": f"{category}基线定义",
+                "说明": f"方案中已提示需收集{category}，但未能明确识别筛选期数据是否可直接并入基线。",
+                "建议": f"请确认{category}在中心层汇总中是否将 SCR/D1 合并展示为“基线”；如允许筛选期近D1数据替代D1，也请确认个例层基线比较应采用哪个访视值。",
+            })
 
     if runtime.get("subject_scope") not in {"all", "randomized"}:
         issues.append({
@@ -2127,7 +2323,6 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
     dseos_sheet = read_listing_alias("DSEOS", optional=True)
     ds_sheet = read_listing_alias("DS", optional=True)
     ae_sheet = read_listing_alias("AE")
-    pc_sheet = read_listing_alias("PC", optional=True)
     visit_index = build_visit_index()
     subject_report_index = load_subject_report_index()
 
@@ -2147,12 +2342,6 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
             ae_flags[subject]["ae"] = True
         if clean_text(get_row_value(row, ["是否为严重不良事件（SAE）？", "是否为严重不良事件"])) == "是":
             ae_flags[subject]["sae"] = True
-
-    pk_flags = defaultdict(bool)
-    for row in pc_sheet["records"]:
-        subject = extract_subject_from_row(row)
-        if clean_text(get_row_value(row, ["是否进行药代动力学（PK）血样采集？", "是否进行PK血样采集？", "是否进行PK血样采集"])) == "是":
-            pk_flags[subject] = True
 
     visit_presence = defaultdict(list)
     observed_phase_names = sorted({clean_text(meta.get("研究分期")) for meta in visit_index.values() if clean_text(meta.get("研究分期"))})
@@ -2224,8 +2413,6 @@ def parse_subject_profiles(reference_groups: dict[str, str]) -> list[dict[str, A
                 "基线/随机日期": baseline_date or MISSING_TEXT,
                 "筛选失败原因": screen_fail_reason if subject_status == "筛选失败" else "",
                 "是否完成研究": completed_study,
-                "是否进入ITT": "是" if randomized else "否",
-                "是否进入PKCS": "是" if clean_text(get_row_value(rand, ["是否进行PK血样采集？", "是否进行PK血样采集"])) == "是" or pk_flags[subject] else "否",
                 "是否存在AE/SAE/SUSAR": "AE" if ae_flags[subject]["ae"] and not ae_flags[subject]["sae"] else ("SAE" if ae_flags[subject]["sae"] else "否"),
                 "是否存在AE": "是" if ae_flags[subject]["ae"] else "否",
                 "是否存在PD": MISSING_TEXT,
@@ -2375,14 +2562,7 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
             all_rows.append(merged)
 
     for (_, metric), rows in grouped_for_baseline.items():
-        baseline_row = None
-        for row in rows:
-            if row["访视编号"] == "D1":
-                baseline_row = row
-                break
-        if baseline_row is None:
-            rows_sorted = sorted(rows, key=lambda x: (x["访视编号"] == "SCR", x["日期"] == MISSING_TEXT, x["日期"], phase_visit_sort_key(x["访视编号"], x["日期"])))
-            baseline_row = rows_sorted[0] if rows_sorted else None
+        baseline_row = select_subject_baseline_row(rows, "疗效")
         baseline = baseline_row["数值结果"] if baseline_row else None
         for row in rows:
             current = row["数值结果"]
@@ -2393,7 +2573,16 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
                     row["较基线百分比变化"] = f"{change / baseline * 100:.2f}%"
                 if should_assign_response_label(row["访视编号"], row["访视名称"], metric):
                     row["关键应答判定"] = numeric_response_label(metric, baseline, current)
-    return sorted(all_rows, key=lambda x: (x["中心"], x["受试者编号"], efficacy_sort_key(x["指标名称"]), x["日期"], x["访视编号"]))
+    return sorted(
+        all_rows,
+        key=lambda x: (
+            x["中心"],
+            x["受试者编号"],
+            efficacy_sort_key(x["指标名称"]),
+            phase_visit_sort_key(clean_text(x.get("访视编号")), clean_text(x.get("日期"))),
+            clean_text(x.get("日期")),
+        ),
+    )
 
 
 def standardize_lab_test_name(raw_name: str) -> str:
@@ -2445,9 +2634,22 @@ def apply_longitudinal_attention_flags(
     metric_label_key: str,
     category_key: str,
 ) -> None:
-    metric_rows.sort(key=lambda x: (x["日期"] == MISSING_TEXT, x["日期"], x["访视编号"]))
+    metric_rows.sort(
+        key=lambda x: (
+            clean_text(x.get("日期")) == MISSING_TEXT,
+            clean_text(x.get("日期")),
+            phase_visit_sort_key(clean_text(x.get("访视编号")), clean_text(x.get("日期"))),
+        )
+    )
     later_normals = [r for r in metric_rows if r["异常方向"] == "正常"]
-    baseline_row = next((r for r in metric_rows if r["访视编号"] == "D1"), metric_rows[0] if metric_rows else None)
+    category = clean_text(metric_rows[0].get(category_key)) if metric_rows else ""
+    if category == "心电图":
+        baseline_category = "心电图"
+    elif category == "生命体征":
+        baseline_category = "生命体征"
+    else:
+        baseline_category = "实验室"
+    baseline_row = select_subject_baseline_row(metric_rows, baseline_category)
     baseline_value = baseline_row["数值结果"] if baseline_row else None
     baseline_normal = baseline_row["异常方向"] == "正常" if baseline_row else False
     deviations: list[tuple[dict[str, Any], float | None]] = []
@@ -2683,6 +2885,12 @@ def build_vital_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list
     rows: list[dict[str, Any]] = []
     by_subject_metric: defaultdict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     sheet = read_listing_alias("VS")
+    measure_specs = [
+        ("体温", ["体温", "检查结果(VSORRES)", "检查结果"], ["体温_UNIT", "单位(VSORRESU)", "单位"]),
+        ("心率", ["脉搏", "心率"], ["脉搏_UNIT", "心率_UNIT", "单位(VSORRESU)", "单位"]),
+        ("收缩压", ["收缩压"], ["收缩压_UNIT", "单位(VSORRESU)", "单位"]),
+        ("舒张压", ["舒张压"], ["舒张压_UNIT", "单位(VSORRESU)", "单位"]),
+    ]
     for row in sheet["records"]:
         center = extract_center_from_row(row)
         subject = extract_subject_from_row(row)
@@ -2694,44 +2902,55 @@ def build_vital_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list
         visit_oid = visit_meta["visit_id"] or clean_text(get_row_value(row, ["访视OID", "访视编号"]))
         clinical_significance = clean_text(get_row_value(row, ["临床意义评价", "临床评估(VSCLSIG)", "临床评估"])) or MISSING_TEXT
         clinical_comment = clean_text(get_row_value(row, ["异常有临床意义，请说明", "异常说明(VSABCS)", "备注"]))
-        test_name = clean_text(get_row_value(row, ["检查项目(VSTEST)", "检查项目"]))
+        explicit_test_name = clean_text(get_row_value(row, ["检查项目(VSTEST)", "检查项目"]))
+        value_items: list[tuple[str, str, str, str]] = []
         test_map = {"体温": "体温", "脉搏": "心率", "心率": "心率", "收缩压": "收缩压", "舒张压": "舒张压"}
-        metric_name = test_map.get(test_name, "")
-        if not metric_name:
-            continue
-        value = clean_text(get_row_value(row, ["检查结果(VSORRES)", "检查结果"]))
-        if not value or value == MISSING_TEXT:
-            continue
-        low, high = vital_reference_range(metric_name)
-        vital_row = normalize_lab_row(
-            {
-                "中心": center,
-                "受试者编号": subject,
-                "受试者键": f"{center}|{subject}",
-                "生命体征类别": "生命体征",
-                "访视编号": visit_oid or MISSING_TEXT,
-                "访视名称": visit_index.get((subject, visit_oid), {}).get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(row)),
-                "访视原始名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视原始名称", MISSING_TEXT),
-                "日期": parse_date(get_row_value(row, ["检查日期(VSDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
-                "生命体征指标": metric_name,
-                "原始指标名称": test_name,
-                "结果值": value,
-                "单位": clean_text(get_row_value(row, ["单位(VSORRESU)", "单位"])) or MISSING_TEXT,
-                "正常值下限": "" if low is None else f"{low:g}",
-                "正常值上限": "" if high is None else f"{high:g}",
-                "正常范围原始文本": "",
-                "临床意义判断": clinical_significance,
-                "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
-                "备注": "",
-                "是否对应AE或Finding": "否",
-                "数据来源sheet": sheet["sheet_name"] or MISSING_TEXT,
-                "原始字段名": find_matching_header(list(row.keys()), ["检查结果(VSORRES)", "检查结果"]) or "检查结果",
-                "图表模式": "numeric",
-                "额外关注标记": "",
-            }
-        )
-        rows.append(vital_row)
-        by_subject_metric[(subject, metric_name)].append(vital_row)
+        if explicit_test_name:
+            metric_name = test_map.get(explicit_test_name, "")
+            value = clean_text(get_row_value(row, ["检查结果(VSORRES)", "检查结果"]))
+            unit = clean_text(get_row_value(row, ["单位(VSORRESU)", "单位"])) or MISSING_TEXT
+            if metric_name and value and value != MISSING_TEXT:
+                value_items.append((metric_name, explicit_test_name, value, unit))
+        else:
+            for metric_name, value_candidates, unit_candidates in measure_specs:
+                value = clean_text(get_row_value(row, value_candidates))
+                if not value or value == MISSING_TEXT:
+                    continue
+                unit = clean_text(get_row_value(row, unit_candidates)) or MISSING_TEXT
+                raw_name = metric_name if metric_name != "心率" else "脉搏"
+                value_items.append((metric_name, raw_name, value, unit))
+
+        for metric_name, raw_name, value, unit in value_items:
+            low, high = vital_reference_range(metric_name)
+            vital_row = normalize_lab_row(
+                {
+                    "中心": center,
+                    "受试者编号": subject,
+                    "受试者键": f"{center}|{subject}",
+                    "生命体征类别": "生命体征",
+                    "访视编号": visit_oid or MISSING_TEXT,
+                    "访视名称": visit_index.get((subject, visit_oid), {}).get("访视名称") or simplify_visit_label(visit_oid, extract_data_section(row)),
+                    "访视原始名称": extract_data_section(row) or visit_index.get((subject, visit_oid), {}).get("访视原始名称", MISSING_TEXT),
+                    "日期": parse_date(get_row_value(row, ["检查日期(VSDAT)", "检查日期"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", MISSING_TEXT),
+                    "生命体征指标": metric_name,
+                    "原始指标名称": raw_name,
+                    "结果值": value,
+                    "单位": unit,
+                    "正常值下限": "" if low is None else f"{low:g}",
+                    "正常值上限": "" if high is None else f"{high:g}",
+                    "正常范围原始文本": "",
+                    "临床意义判断": clinical_significance,
+                    "研究者临床评估": "" if clinical_significance == "正常" else clinical_comment,
+                    "备注": "",
+                    "是否对应AE或Finding": "否",
+                    "数据来源sheet": sheet["sheet_name"] or MISSING_TEXT,
+                    "原始字段名": raw_name,
+                    "图表模式": "numeric",
+                    "额外关注标记": "",
+                }
+            )
+            rows.append(vital_row)
+            by_subject_metric[(subject, metric_name)].append(vital_row)
 
     if INCLUDE_USV == "yes":
         wb = openpyxl.load_workbook(LISTING_XLSX, read_only=True, data_only=True)
@@ -2975,6 +3194,14 @@ def attach_finding_links(
     ae_rows: list[dict[str, Any]] | None = None,
     vital_rows: list[dict[str, Any]] | None = None,
 ) -> None:
+    if not finding_rows:
+        for subject in subject_profiles:
+            subject["是否存在核查Finding"] = "否"
+            subject["是否存在方案偏离"] = subject.get("是否存在方案偏离") or MISSING_TEXT
+            subject["是否存在PD"] = subject.get("是否存在PD") or MISSING_TEXT
+            subject["是否存在AE/PD/Finding"] = "AE" if subject.get("是否存在AE") == "是" else "否"
+            subject["是否为重点核查受试者"] = MISSING_TEXT
+        return
     finding_by_subject = defaultdict(list)
     for row in finding_rows:
         if row["受试者编号"]:
@@ -3090,6 +3317,7 @@ def build_center_aggregate_payload(
                         metric_value=metric,
                         subject_group_map=subject_group_map,
                         denominator_by_group=denominator_by_group,
+                        summary_category="疗效",
                     ),
                 }
                 for metric in continuous_efficacy_metrics
@@ -3122,6 +3350,7 @@ def build_center_aggregate_payload(
                         metric_value=metric,
                         subject_group_map=subject_group_map,
                         denominator_by_group=denominator_by_group,
+                        summary_category="心电图" if metric == "QTc间期" else "实验室",
                     ),
                 }
                 for metric in lab_metrics
@@ -3136,6 +3365,7 @@ def build_center_aggregate_payload(
                         metric_value=metric,
                         subject_group_map=subject_group_map,
                         denominator_by_group=denominator_by_group,
+                        summary_category="生命体征",
                     ),
                 }
                 for metric in vital_metrics
@@ -3368,7 +3598,8 @@ def run_qc_checks(
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        rows = [{}]
+        path.write_text("", encoding="utf-8-sig")
+        return
     fieldnames: list[str] = []
     for row in rows:
         for key in row.keys():
@@ -3423,6 +3654,21 @@ def build_protocol_summary_markdown(protocol_summary: dict[str, Any]) -> str:
         lines.append(f"- {'；'.join(assessments)}")
     else:
         lines.append("- 未从方案文本中识别到明确评估类别。")
+    lines.extend(["", "## 基线与特殊访视规则"])
+    baseline_rules = protocol_summary.get("baseline_rules", {})
+    if baseline_rules:
+        for category in ["实验室", "心电图", "生命体征"]:
+            rule = baseline_rules.get(category)
+            if not rule:
+                continue
+            if rule.get("status") == "confirmed":
+                lines.append(f"- {category}：已识别到近D1筛选期数据可并入基线。证据：{rule.get('evidence', '')}")
+            elif rule.get("status") == "unclear":
+                lines.append(f"- {category}：尚未从方案中明确识别基线合并规则，需用户确认。")
+        if baseline_rules.get("has_early_exit"):
+            lines.append("- 方案/流程表提及提前退出访视。中心层汇总图不绘制该访视，但表格保留并放在最后一行；个例层按最后一个访视点展示。")
+    else:
+        lines.append("- 未识别到明确基线或提前退出规则。")
     return "\n".join(lines) + "\n"
 
 
@@ -3476,6 +3722,11 @@ def build_unresolved_questions(field_mapping: list[dict[str, Any]], qc: dict[str
 
 def render_html(payload: dict[str, Any]) -> str:
     data_json = json.dumps(payload, ensure_ascii=False)
+    has_findings = bool(payload.get("has_findings"))
+    subtitle = "疗效、实验室、生命体征与 Finding 的中文交互式核查视图" if has_findings else "疗效、实验室与生命体征的中文交互式核查视图"
+    toolbar_columns = "1.1fr 1fr 1fr 1fr 1fr 1fr 1fr 1.1fr" if has_findings else "1.1fr 1fr 1fr 1fr 1fr 1fr 1.1fr"
+    finding_filter_control = '<div class="control"><label>Finding筛选</label><select id="findingFilter"><option value="all">全部Finding</option><option value="high">高风险</option><option value="mid">中风险</option><option value="primary">影响主要终点</option><option value="safety">影响安全性</option><option value="data">影响数据完整性</option><option value="regulatory">需监管备答</option></select></div>' if has_findings else ""
+    abnormal_finding_option = '<option value="finding">仅Finding关联</option>' if has_findings else ""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3499,7 +3750,7 @@ body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC"
 header {{ position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid var(--border); padding: 14px 18px; }}
 .title {{ font-size: 22px; font-weight: 700; }}
 .subtitle {{ color: var(--muted); font-size: 13px; margin-top: 4px; }}
-.toolbar.compact {{ display: grid; grid-template-columns: 1.1fr 1fr 1fr 1fr 1fr 1fr 1.1fr; gap: 10px; margin-top: 14px; align-items: end; }}
+.toolbar.compact {{ display: grid; grid-template-columns: {toolbar_columns}; gap: 10px; margin-top: 14px; align-items: end; }}
 .toolbar .control {{ display: grid; gap: 4px; min-width: 0; }}
 .toolbar label {{ font-size: 12px; color: #8b5c00; font-weight: 700; }}
 select, input {{ width: 100%; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; background: #fff; font-size: 13px; }}
@@ -3548,15 +3799,15 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #fcfbf7; borde
 <body>
 <header>
   <div class="title">{HTML_TITLE or "受试者Patient Profile"}</div>
-  <div class="subtitle">疗效、实验室、生命体征与 Finding 的中文交互式核查视图</div>
+  <div class="subtitle">{subtitle}</div>
   <div class="toolbar compact">
     <div class="control"><label>中心</label><select id="centerSelect"></select></div>
     <div class="control"><label>受试者</label><select id="subjectSelect"></select></div>
     <div class="control"><label>疗效指标</label><select id="efficacyMetricSelect"></select></div>
     <div class="control"><label>实验室指标</label><select id="labMetricSelect"></select></div>
     <div class="control"><label>生命体征</label><select id="vitalMetricSelect"></select></div>
-    <div class="control"><label>异常值</label><select id="abnormalFilter"><option value="all">全部</option><option value="low">仅低值</option><option value="high">仅高值</option><option value="comment">仅有评估/备注</option><option value="finding">仅Finding关联</option></select></div>
-    <div class="control"><label>Finding筛选</label><select id="findingFilter"><option value="all">全部Finding</option><option value="high">高风险</option><option value="mid">中风险</option><option value="primary">影响主要终点</option><option value="safety">影响安全性</option><option value="data">影响数据完整性</option><option value="regulatory">需监管备答</option></select></div>
+    <div class="control"><label>异常值</label><select id="abnormalFilter"><option value="all">全部</option><option value="low">仅低值</option><option value="high">仅高值</option><option value="comment">仅有评估/备注</option>{abnormal_finding_option}</select></div>
+    {finding_filter_control}
     <div class="control"><label>关键词</label><input id="globalSearch" placeholder="受试者/指标/Finding"></div>
   </div>
 </header>
@@ -3575,6 +3826,7 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #fcfbf7; borde
 </main>
 <script>
 const DATA = {data_json};
+const HAS_FINDINGS = !!DATA.has_findings;
 
 function escapeHtml(value) {{
   return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -3607,7 +3859,9 @@ function efficacyHeaders(metric) {{
   if (((DATA.protocol_summary || {{}}).response_rules || []).some(item => item.metric === metric)) {{
     headers.push("关键应答判定");
   }}
-  headers.push("问题标记","关联Finding编号","数据来源sheet");
+  headers.push("问题标记");
+  if (HAS_FINDINGS) headers.push("关联Finding编号");
+  headers.push("数据来源sheet");
   return headers;
 }}
 function makeTable(headers, rows, tableId) {{
@@ -3657,7 +3911,7 @@ function currentFilters() {{
     labMetric: getValue("labMetricSelect"),
     vitalMetric: getValue("vitalMetricSelect"),
     abnormal: getValue("abnormalFilter"),
-    finding: getValue("findingFilter"),
+    finding: HAS_FINDINGS ? getValue("findingFilter") : "all",
     search: document.getElementById("globalSearch").value.trim().toLowerCase()
   }};
 }}
@@ -3786,20 +4040,22 @@ function renderChart(rows, metricName, seriesType, chartOptions = {{}}) {{
 }}
 function renderAggregateContinuousChart(rows, metricName) {{
   if (!rows.length) return `<div class="summary-line">该指标当前无可汇总的连续数据。</div>`;
+  const plotRows = rows.filter(r => r["中心汇总图排除"] !== "是");
+  if (!plotRows.length) return `<div class="summary-line">该指标仅存在提前退出类访视数据，中心层图中不绘制；请以下方表格最后一行核对。</div>`;
   const trialColor = "#FF9900";
   const trialTextColor = "#8a5a00";
   const controlColor = "#8A8A8A";
   const width = 980, height = 320, left = 70, right = 30, top = 28, bottom = 82;
   const plotW = width - left - right, plotH = height - top - bottom;
-  const trialMeans = rows.map(r => Number(r["试验组均值数值"])).filter(v => !Number.isNaN(v));
-  const controlMeans = rows.map(r => Number(r["对照组均值数值"])).filter(v => !Number.isNaN(v));
-  const trialSds = rows.map(r => Number(r["试验组标准差数值"] || 0));
-  const controlSds = rows.map(r => Number(r["对照组标准差数值"] || 0));
-  const mins = rows.flatMap((r, i) => [
+  const trialMeans = plotRows.map(r => Number(r["试验组均值数值"])).filter(v => !Number.isNaN(v));
+  const controlMeans = plotRows.map(r => Number(r["对照组均值数值"])).filter(v => !Number.isNaN(v));
+  const trialSds = plotRows.map(r => Number(r["试验组标准差数值"] || 0));
+  const controlSds = plotRows.map(r => Number(r["对照组标准差数值"] || 0));
+  const mins = plotRows.flatMap((r, i) => [
     Number.isNaN(Number(r["试验组均值数值"])) ? null : Number(r["试验组均值数值"]) - trialSds[i],
     Number.isNaN(Number(r["对照组均值数值"])) ? null : Number(r["对照组均值数值"]) - controlSds[i],
   ]).filter(v => v !== null);
-  const maxs = rows.flatMap((r, i) => [
+  const maxs = plotRows.flatMap((r, i) => [
     Number.isNaN(Number(r["试验组均值数值"])) ? null : Number(r["试验组均值数值"]) + trialSds[i],
     Number.isNaN(Number(r["对照组均值数值"])) ? null : Number(r["对照组均值数值"]) + controlSds[i],
   ]).filter(v => v !== null);
@@ -3808,15 +4064,15 @@ function renderAggregateContinuousChart(rows, metricName) {{
   let yMax = Math.max(...maxs);
   if (yMin === yMax) yMax += 1;
   const yAxis = buildYAxis(left, right, top, bottom, width, height, yMin, yMax, 4);
-  const xPos = i => left + (rows.length === 1 ? plotW / 2 : (i / (rows.length - 1)) * plotW);
+  const xPos = i => left + (plotRows.length === 1 ? plotW / 2 : (i / (plotRows.length - 1)) * plotW);
   const yPos = v => top + ((yMax - v) / (yMax - yMin)) * plotH;
-  const trialPath = rows.map((r, i) => Number.isNaN(Number(r["试验组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["试验组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
-  const controlPath = rows.map((r, i) => Number.isNaN(Number(r["对照组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["对照组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
+  const trialPath = plotRows.map((r, i) => Number.isNaN(Number(r["试验组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["试验组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
+  const controlPath = plotRows.map((r, i) => Number.isNaN(Number(r["对照组均值数值"])) ? null : `${{i === 0 ? "M" : "L"}}${{xPos(i).toFixed(1)}},${{yPos(Number(r["对照组均值数值"])).toFixed(1)}}`).filter(Boolean).join(" ");
   const transferVisit = DATA.transfer_marker_visit || "";
-  const transferIndex = transferVisit ? rows.findIndex(r => r["访视编号"] === transferVisit) : -1;
+  const transferIndex = transferVisit ? plotRows.findIndex(r => r["访视编号"] === transferVisit) : -1;
   const transferLine = transferIndex >= 0 ? renderTransferMarker(xPos(transferIndex).toFixed(1), top, height, bottom, "转组") : "";
   let marks = "";
-  rows.forEach((r, i) => {{
+  plotRows.forEach((r, i) => {{
     const cx = xPos(i);
     marks += `<text x="${{cx.toFixed(1)}}" y="${{height-34}}" text-anchor="middle" font-size="10" fill="#555">${{escapeHtml(r["访视编号"])}}</text>`;
     if (!Number.isNaN(Number(r["试验组均值数值"]))) {{
@@ -3861,19 +4117,21 @@ function renderAggregateContinuousChart(rows, metricName) {{
 }}
 function renderAggregateBinaryChart(rows, responseName) {{
   if (!rows.length) return `<div class="summary-line">该应答当前无可汇总数据。</div>`;
+  const plotRows = rows.filter(r => r["中心汇总图排除"] !== "是");
+  if (!plotRows.length) return `<div class="summary-line">该应答仅存在提前退出类访视数据，中心层图中不绘制；请以下方表格最后一行核对。</div>`;
   const trialFill = "#FF9900";
   const controlFill = "#8A8A8A";
   const width = 980, height = 320, left = 70, right = 30, top = 28, bottom = 82;
   const plotW = width - left - right, plotH = height - top - bottom;
   const yAxis = buildYAxis(left, right, top, bottom, width, height, 0, 100, 4);
-  const xPos = i => left + (i + 0.5) * (plotW / rows.length);
-  const barW = Math.max(24, plotW / Math.max(rows.length * 2.2, 1));
+  const xPos = i => left + (i + 0.5) * (plotW / plotRows.length);
+  const barW = Math.max(24, plotW / Math.max(plotRows.length * 2.2, 1));
   const yPos = v => top + ((100 - v) / 100) * plotH;
   const transferVisit = DATA.transfer_marker_visit || "";
-  const transferIndex = transferVisit ? rows.findIndex(r => r["访视编号"] === transferVisit) : -1;
+  const transferIndex = transferVisit ? plotRows.findIndex(r => r["访视编号"] === transferVisit) : -1;
   const transferLine = transferIndex >= 0 ? renderTransferMarker(xPos(transferIndex).toFixed(1), top, height, bottom, "转组") : "";
   let bars = "";
-  rows.forEach((r, i) => {{
+  plotRows.forEach((r, i) => {{
     const cx = xPos(i);
     const trialPct = Number(r["试验组应答比例数值"] || 0);
     const controlPct = Number(r["对照组应答比例数值"] || 0);
@@ -4000,11 +4258,12 @@ function renderCenterSummary(center, filters) {{
     vitalSection = `<section><div class="module-title">生命体征汇总</div>${{renderContinuousBlocks(data.vital_continuous || [], filters.vitalMetric) || "<div class='summary-line'>当前筛选下无生命体征汇总。</div>"}}</section>`;
   }}
 
+  const earlyExitNote = DATA.has_early_exit_visits ? `<div class="summary-line">已识别提前退出类访视。中心层图中不绘制该访视，表格最后一行保留；个例层按最后一个访视点展示。</div>` : "";
   return `<article class="subject-card">
     <div class="subject-head">
       <div><h3>${{escapeHtml(center)}} / 全部受试者汇总</h3></div>
     </div>
-    <section><div class="module-title">Profiles汇总</div>${{flow}}<div class="grid">${{profileCards}}</div></section>
+    <section><div class="module-title">Profiles汇总</div>${{earlyExitNote}}${{flow}}<div class="grid">${{profileCards}}</div></section>
     ${{efficacySection}}
     ${{labSection}}
     ${{vitalSection}}
@@ -4014,14 +4273,14 @@ function basicFieldsForSubject(subject) {{
   if (subject["受试者状态"] === "筛选失败") {{
     return ["中心","受试者编号","年龄","年龄组","性别","知情同意日期","筛选失败原因","是否存在AE/PD/Finding"];
   }}
-  return ["中心","受试者编号","年龄","年龄组","性别","随机组别","筛选日期","知情同意日期","基线/随机日期", ...(DATA.phase_field_labels || []), "是否完成研究","是否进入ITT","是否进入PKCS","是否存在AE/PD/Finding","实验室特殊关注","生命体征特殊关注"];
+  return ["中心","受试者编号","年龄","年龄组","性别","随机组别","筛选日期","知情同意日期","基线/随机日期", ...(DATA.phase_field_labels || []), "是否完成研究","是否存在AE/PD/Finding","实验室特殊关注","生命体征特殊关注"];
 }}
 function subjectTags(subject) {{
   const tags = [];
   if (subject["随机组别"]) tags.push(`<span class="pill">${{escapeHtml(subject["随机组别"])}}</span>`);
   if (subject["年龄组"] === "青少年") tags.push(`<span class="pill adolescent">青少年受试者</span>`);
   if (subject["受试者状态"] === "筛选失败") tags.push(`<span class="pill high">筛选失败</span>`);
-  if (subject["是否存在核查Finding"] === "是") tags.push(`<span class="pill mid">有Finding</span>`);
+  if (HAS_FINDINGS && subject["是否存在核查Finding"] === "是") tags.push(`<span class="pill mid">有Finding</span>`);
   if ((subject["是否存在AE/SAE/SUSAR"] || "否") !== "否") tags.push(`<span class="pill low">${{escapeHtml(subject["是否存在AE/SAE/SUSAR"])}}</span>`);
   return tags.join("");
 }}
@@ -4044,7 +4303,9 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     const chosen = filters.labMetric === "__ALL__" ? metrics : metrics.filter(m => m === filters.labMetric);
     const blocks = chosen.map(metric => {{
       const rows = subjectLabs.filter(r => r["检验项目标准化名称"] === metric);
-      const headers = ["实验室显示分组","访视编号","访视名称","日期","检验项目标准化名称","原始检验项目名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注","是否对应AE或Finding","数据来源sheet"];
+      const headers = ["实验室显示分组","访视编号","访视名称","日期","检验项目标准化名称","原始检验项目名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注"];
+      if (HAS_FINDINGS) headers.push("是否对应AE或Finding");
+      headers.push("数据来源sheet");
       return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "lab", {{ showTransferLine: isControlGroupText(subject["随机组别"]) }})}}${{makeTable(headers, rows, `lab-${{subject["受试者编号"]}}-${{metric}}`)}}`;
     }}).join("");
     labSection = `<section><div class="module-title">实验室检查数据模块</div>${{blocks || "<div class='summary-line'>当前筛选下无实验室数据。</div>"}}</section>`;
@@ -4055,7 +4316,9 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     const chosen = filters.vitalMetric === "__ALL__" ? metrics : metrics.filter(m => m === filters.vitalMetric);
     const blocks = chosen.map(metric => {{
       const rows = subjectVitals.filter(r => r["生命体征指标"] === metric);
-      const headers = ["访视编号","访视名称","日期","生命体征指标","原始指标名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注","是否对应AE或Finding","数据来源sheet"];
+      const headers = ["访视编号","访视名称","日期","生命体征指标","原始指标名称","结果值","单位","正常值下限","正常值上限","异常方向","临床意义判断","研究者临床评估","额外关注标记","备注"];
+      if (HAS_FINDINGS) headers.push("是否对应AE或Finding");
+      headers.push("数据来源sheet");
       return `<div class="module-title">${{escapeHtml(metric)}}</div>${{renderChart(rows, metric, "vital", {{ showTransferLine: isControlGroupText(subject["随机组别"]) }})}}${{makeTable(headers, rows, `vital-${{subject["受试者编号"]}}-${{metric}}`)}}`;
     }}).join("");
     vitalSection = `<section><div class="module-title">生命体征模块</div>${{blocks || "<div class='summary-line'>当前筛选下无生命体征数据。</div>"}}</section>`;
@@ -4066,7 +4329,7 @@ function renderSubjectCard(subject, subjectFindings, subjectEfficacy, subjectLab
     aeSection = `<section><div class="module-title">AE信息</div>${{subjectAEs.length ? makeTable(headers, subjectAEs, `ae-${{subject["受试者编号"]}}`) : "<div class='summary-line'>该筛选失败受试者未匹配到AE记录。</div>"}}</section>`;
   }}
   const findingHeaders = ["Finding编号","问题分类","问题严重程度","原始问题描述","涉及访视","问题状态","是否影响受试者权益","是否影响安全性","是否影响入组合格性","是否影响主要终点","是否影响关键次要终点","是否影响实验室安全性判断","是否影响用药依从性/暴露","是否影响数据完整性","是否需监管备答","建议现场核查回复口径","现场回复示例","残余风险等级"];
-  const findingSection = `<section class="finding-fixed" data-section="findings-fixed"><div class="module-title">Finding固定展示模块</div>${{subjectFindings.length ? makeTable(findingHeaders, subjectFindings, `find-${{subject["受试者编号"]}}`) : "<div class='summary-line'>该受试者当前未匹配到 subject-level Finding。</div>"}}</section>`;
+  const findingSection = HAS_FINDINGS ? `<section class="finding-fixed" data-section="findings-fixed"><div class="module-title">Finding固定展示模块</div>${{subjectFindings.length ? makeTable(findingHeaders, subjectFindings, `find-${{subject["受试者编号"]}}`) : "<div class='summary-line'>该受试者当前未匹配到 subject-level Finding。</div>"}}</section>` : "";
   return `<article class="subject-card">
     <div class="subject-head">
       <div><h3>${{escapeHtml(subject["受试者编号"])}}</h3><div class="summary-line">${{escapeHtml(subject["中心"])}}</div></div>
@@ -4124,7 +4387,7 @@ function render() {{
   }}
   const cards = subjects.map(subject => {{
     const key = `${{subject["中心"]}}|${{subject["受试者编号"]}}`;
-    const subjectFindings = DATA.findings.filter(r => r["受试者键"] === key && findingPass(r, filters.finding) && JSON.stringify(r).toLowerCase().includes(filters.search || ""));
+    const subjectFindings = HAS_FINDINGS ? DATA.findings.filter(r => r["受试者键"] === key && findingPass(r, filters.finding) && JSON.stringify(r).toLowerCase().includes(filters.search || "")) : [];
     const subjectEfficacy = DATA.efficacy.filter(r => r["受试者键"] === key && (filters.efficacyMetric === "__ALL__" || r["指标名称"] === filters.efficacyMetric) && JSON.stringify(r).toLowerCase().includes(filters.search || ""));
     const subjectLabs = DATA.labs.filter(r => r["受试者键"] === key && (filters.labMetric === "__ALL__" || r["检验项目标准化名称"] === filters.labMetric) && labPass(r, filters.abnormal) && JSON.stringify(r).toLowerCase().includes(filters.search || ""));
     const subjectVitals = DATA.vitals.filter(r => r["受试者键"] === key && (filters.vitalMetric === "__ALL__" || r["生命体征指标"] === filters.vitalMetric) && labPass(r, filters.abnormal) && JSON.stringify(r).toLowerCase().includes(filters.search || ""));
@@ -4135,7 +4398,7 @@ function render() {{
   bindTableSorting();
 }}
 document.getElementById("centerSelect").addEventListener("change", () => {{ syncSubjectOptions(); render(); }});
-["subjectSelect","efficacyMetricSelect","labMetricSelect","vitalMetricSelect","abnormalFilter","findingFilter"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["subjectSelect","efficacyMetricSelect","labMetricSelect","vitalMetricSelect","abnormalFilter", ...(HAS_FINDINGS ? ["findingFilter"] : [])].forEach(id => document.getElementById(id).addEventListener("change", render));
 document.getElementById("globalSearch").addEventListener("input", render);
 initSelectors();
 renderStaticAppendices();
@@ -4162,6 +4425,10 @@ def build_payload() -> dict[str, Any]:
     finding_rows = [row for row in finding_rows if not row.get("受试者键") or row.get("受试者键") in allowed_subject_keys]
     ae_rows = [row for row in ae_rows if row.get("受试者键") in allowed_subject_keys]
     attach_finding_links(subject_profiles, efficacy_rows, lab_rows, finding_rows, ae_rows, vital_rows)
+    if not finding_rows:
+        for row in efficacy_rows:
+            row.pop("与Finding是否有关联", None)
+            row.pop("关联Finding编号", None)
     summarize_lab_attention_by_subject(subject_profiles, lab_rows)
     summarize_vital_attention_by_subject(subject_profiles, vital_rows)
     center_aggregate = build_center_aggregate_payload(subject_profiles, efficacy_rows, lab_rows, vital_rows)
@@ -4177,18 +4444,29 @@ def build_payload() -> dict[str, Any]:
     unresolved_markdown = build_unresolved_questions(field_mapping, qc, subject_profiles, finding_rows)
     efficacy_metric_count = len(unique([r["指标名称"] for r in efficacy_rows]))
     lab_metric_count = len(unique([r["检验项目标准化名称"] for r in lab_rows]))
-    phase_field_labels = []
-    for phase_name in STUDY_PHASES:
-        if clean_text(phase_name):
-            phase_field_labels.extend([f"{phase_name}进入日期", f"{phase_name}完成日期"])
+    phase_field_labels = unique(
+        [
+            key
+            for subject in subject_profiles
+            for key in subject.keys()
+            if key.endswith("进入日期") or key.endswith("完成日期")
+        ]
+    )
+    observed_phase_names = unique([field[:-4] for field in phase_field_labels if field.endswith("进入日期")])
+    has_early_exit_visits = any(
+        is_early_exit_visit(row.get("访视编号"), row.get("访视名称"))
+        for row in (efficacy_rows + lab_rows + vital_rows)
+    ) or bool((PROTOCOL_SUMMARY.get("baseline_rules") or {}).get("has_early_exit"))
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "centers": TARGET_CENTERS,
         "protocol_summary": deepcopy(PROTOCOL_SUMMARY),
-        "study_phases": STUDY_PHASES[:],
+        "study_phases": observed_phase_names,
         "phase_field_labels": phase_field_labels,
         "subject_scope": SUBJECT_SCOPE,
         "include_usv": INCLUDE_USV,
+        "has_findings": bool(finding_rows),
+        "has_early_exit_visits": has_early_exit_visits,
         "transfer_marker_visit": detect_transfer_marker_visit(),
         "subjects": subject_profiles,
         "efficacy": efficacy_rows,
@@ -4211,6 +4489,8 @@ def validate_payload_or_raise(payload: dict[str, Any]) -> None:
     blocking_questions: list[str] = []
     subjects = payload.get("subjects", [])
     efficacy = payload.get("efficacy", [])
+    labs = payload.get("labs", [])
+    vitals = payload.get("vitals", [])
     selected_metrics = {item["metric"] for item in PROTOCOL_SUMMARY.get("selected_metrics", [])}
     metrics_with_rows = {clean_text(row.get("指标名称")) for row in efficacy}
     for metric in sorted(selected_metrics - metrics_with_rows):
@@ -4222,6 +4502,13 @@ def validate_payload_or_raise(payload: dict[str, Any]) -> None:
             if clean_text(subject.get(field)) == MISSING_TEXT:
                 blocking_questions.append(f"{field} 无法定位。请指出在哪个listing的哪个sheet、以哪一例记录进行识别。示例受试者：{subject.get('受试者编号')}。")
                 break
+    required_assessments = set(PROTOCOL_SUMMARY.get("required_assessments", []))
+    if "实验室" in required_assessments and not labs:
+        blocking_questions.append("方案/研究流程表提示需收集实验室检查，但当前未成功生成任何实验室数据。请指出实验室数据位于哪个listing的哪个sheet，或明确本轮不纳入。")
+    if "生命体征" in required_assessments and not vitals:
+        blocking_questions.append("方案/研究流程表提示需收集生命体征，但当前未成功生成任何生命体征数据。请指出生命体征数据位于哪个listing的哪个sheet，或明确本轮不纳入。")
+    if "心电图" in required_assessments and not any(clean_text(row.get("检验项目标准化名称")) == "QTc间期" for row in labs):
+        blocking_questions.append("方案/研究流程表提示需收集心电图/QTc，但当前未成功生成QTc间期数据。请指出心电图数据位于哪个listing的哪个sheet、哪一列，或明确本轮不纳入。")
     if blocking_questions:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUTPUT_DIR / "blocking_questions.md").write_text(

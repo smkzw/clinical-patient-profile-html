@@ -85,6 +85,12 @@ def create_listing_workbook(path: Path) -> None:
     ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", "白细胞计数", 6.2, "10^9/L", 3.5, 9.5, "3.5-9.5", "正常", "", "正常"])
     ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", "白细胞计数", 5.8, "10^9/L", 3.5, 9.5, "3.5-9.5", "正常", "", "正常"])
 
+    ws = wb.create_sheet("EG--12导联心电图")
+    ws.append(["研究中心", "受试者", "访视OID", "访视名称", "是否进行12导联心电图检查？", "检查日期", "QTc间期", "单位", "临床意义评价", "若异常，请详述"])
+    ws.append(["", "", "", "", "", "", "", "", "", ""])
+    ws.append(["示例中心医院", "S01001", "D1", "基线", "是", "2026-01-02", 410, "ms", "正常", ""])
+    ws.append(["示例中心医院", "S01001", "D15", "第15天", "是", "2026-01-16", 412, "ms", "正常", ""])
+
     wb.save(path)
 
 
@@ -116,6 +122,8 @@ def create_protocol_text(path: Path) -> None:
                 "次要终点：第15天 IGA 评分变化。",
                 "次要终点：第15天达到 IGA-TS 的受试者比例。",
                 "研究流程：筛选期、基线（D1）、第15天（D15）进行疗效评估。",
+                "实验室、生命体征和心电图在W0/D1进行；若筛选期访视发生在给药前7天内，可接受筛选期结果作为基线，D1无需重复。",
+                "受试者如提前退出，应完成提前退出访视。",
             ]
         ),
         encoding="utf-8",
@@ -136,7 +144,7 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_root, ignore_errors=True)
 
-    def run_builder(self, *extra_args: str) -> None:
+    def run_builder(self, *extra_args: str, include_finding: bool = True) -> None:
         cmd = [
             "python3",
             str(SCRIPT_PATH),
@@ -144,8 +152,6 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
             str(self.project_dir),
             "--listing-xlsx",
             str(self.project_dir / "demo_listing.xlsx"),
-            "--finding-xlsx",
-            str(self.project_dir / "demo_finding.xlsx"),
             "--pd-def-xlsx",
             str(self.project_dir / "demo_pd_definition.xlsx"),
             "--centers",
@@ -158,6 +164,8 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
             str(self.output_dir),
             *extra_args,
         ]
+        if include_finding:
+            cmd.extend(["--finding-xlsx", str(self.project_dir / "demo_finding.xlsx")])
         subprocess.run(cmd, check=True)
 
     def count_rows(self, file_name: str) -> int:
@@ -244,6 +252,23 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertEqual(MODULE.summary_group_label("placebo"), "对照组")
         self.assertEqual(MODULE.simplify_visit_label("D29±1d", "双盲治疗期V5（D29±1d）"), "D29")
         self.assertEqual(MODULE.simplify_visit_label("SCR", "筛选/导入期V1（D-7~D-1）"), "SCR")
+
+    def test_protocol_summary_detects_baseline_and_early_exit(self) -> None:
+        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        self.assertEqual(summary["baseline_rules"]["实验室"]["status"], "confirmed")
+        self.assertEqual(summary["baseline_rules"]["心电图"]["status"], "confirmed")
+        self.assertEqual(summary["baseline_rules"]["生命体征"]["status"], "confirmed")
+        self.assertTrue(summary["baseline_rules"]["has_early_exit"])
+
+    def test_build_without_finding_hides_finding_ui(self) -> None:
+        os.remove(self.project_dir / "demo_finding.xlsx")
+        self.run_builder(include_finding=False)
+        html = (self.output_dir / "patient_profile.html").read_text(encoding="utf-8")
+        self.assertNotIn("Finding筛选", html)
+        self.assertIn("疗效、实验室与生命体征的中文交互式核查视图", html)
+        self.assertIn('"has_findings": false', html)
+        self.assertNotIn("是否进入ITT", html)
+        self.assertNotIn("是否进入PKCS", html)
 
 
 @unittest.skipUnless(os.environ.get("PATIENT_PROFILE_REAL_FIXTURE_DIR"), "Optional regression test requires PATIENT_PROFILE_REAL_FIXTURE_DIR")

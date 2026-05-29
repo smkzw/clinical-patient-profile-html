@@ -7,7 +7,7 @@ description: Trigger this skill when the user says “制作patient profile”, 
 
 Use this skill for clinical-study patient profile HTML work where the output must stay source-grounded and inspection-ready.
 
-This skill is best when the user provides subject listings, protocol/amendment files, and finding trackers, and wants an offline HTML that combines subject profile, efficacy trends, lab trends, vital signs, and finding review.
+This skill is best when the user provides subject listings, protocol/amendment files, and optionally finding trackers, and wants an offline HTML that combines subject profile, efficacy trends, lab trends, vital signs, and optional finding review.
 
 If the user explicitly says `制作patient profile` or an equivalent phrase after uploading files, invoke this skill immediately and start with file inspection rather than waiting for extra instructions.
 Do not require an additional “开始构建” instruction.
@@ -34,6 +34,11 @@ Also inspect:
 - 纳入全部受试者，还是仅纳入已随机受试者。
 - 是否纳入 USV/计划外访视数据。
 
+Also settle these when precheck cannot resolve them from the uploaded files:
+
+- 是否纳入全部中心，还是仅纳入指定中心。
+- 实验室 / 心电图 / 生命体征在中心层是否应将 SCR / D1 合并为“基线”。
+
 4. If precheck shows only `提示`, continue directly to full build.
 
 5. If precheck shows `阻断` or `需确认`, ask only the smallest necessary question and stop.
@@ -58,7 +63,7 @@ Use `references/validation_checklist.md`.
 
 - A main listing workbook with subject-level tabs for demographics, randomization, visits, efficacy, labs, AE, and vital signs.
 - A protocol, amendment, or errata file that contains endpoint definitions and the study flow/assessment schedule.
-- A finding workbook or self-inspection/audit tracker.
+- A finding workbook or self-inspection/audit tracker when the user wants finding linkage or fixed finding display.
 
 ## Optional Inputs
 
@@ -75,6 +80,7 @@ Ask the user instead of proceeding when any of these happen:
 - The protocol is missing or unreadable.
 - The protocol does not yield a clear endpoint-to-metric mapping.
 - The protocol does not make it clear whether an efficacy variable is continuous or binary.
+- The protocol does not make it clear whether lab / ECG / vital-sign screening results can be used as center-level baseline.
 - The finding workbook exists but the relevant sheet or subject column cannot be confirmed.
 - Key efficacy sheets are missing or likely renamed.
 - A protocol-required assessment category appears in the study flow table but no corresponding listing sheet or field can be found.
@@ -95,6 +101,8 @@ Prefer updating `suggested_project_config.json` before editing Python.
 The skill must fully deconstruct every uploaded file that could affect mapping or scope.
 Do not skip sheet-level inspection because a prior project looked similar.
 Do not silently fall back to a previous project’s endpoint set, phase labels, subject-ID format, or visit model.
+Do not continue to HTML generation if critical mapping remains ambiguous; stop and ask the user for a concrete file/sheet/field example.
+If the study flow table says a category should be collected but the listing yields no usable rows, stop and ask instead of silently omitting it.
 
 Adjust the script only in these places when the new project differs beyond config:
 
@@ -106,6 +114,7 @@ Adjust the script only in these places when the new project differs beyond confi
 - group and center normalization helpers
 
 Do not fabricate subject dates, ranges, response flags, or normal limits.
+If there is no finding workbook, continue without the finding module and without subject-level “关联Finding” descriptions.
 
 ## Outputs
 
