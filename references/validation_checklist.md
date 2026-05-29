@@ -43,16 +43,9 @@ For each spot check, compare HTML against the source workbook on:
 
 ## Response logic checks
 
-Verify that response flags are only assigned where the project definition supports them.
+Verify that response flags are only assigned where the current protocol explicitly defines a responder rule and the rule is computable from the available subject-level data.
 
-Examples in the current RUX implementation:
-
-- EASI
-- IGA
-- Itch NRS
-- PROMIS 8a / 8b
-
-Do not assume the same response rules for a new project without confirming the endpoint definitions.
+If the protocol defines only continuous efficacy endpoints, the response flag column should remain blank rather than carrying forward any prior-project responder labels.
 
 ## Final decision rule
 

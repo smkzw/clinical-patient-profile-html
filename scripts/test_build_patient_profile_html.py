@@ -260,6 +260,34 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertEqual(summary["baseline_rules"]["生命体征"]["status"], "confirmed")
         self.assertTrue(summary["baseline_rules"]["has_early_exit"])
 
+    def test_protocol_summary_extracts_response_rules_from_protocol_text(self) -> None:
+        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        labels = {item["label"] for item in summary["response_rules"]}
+        self.assertIn("EASI-75", labels)
+        self.assertIn("IGA-TS", labels)
+
+    def test_no_protocol_response_definition_keeps_response_blank(self) -> None:
+        protocol_path = self.project_dir / "only_continuous.txt"
+        protocol_path.write_text(
+            "\n".join(
+                [
+                    "研究方案",
+                    "主要终点：第15天 EASI 评分较基线变化。",
+                    "次要终点：第15天 IGA 评分变化。",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        summary = MODULE.detect_protocol_endpoint_summary([protocol_path], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        self.assertEqual(summary["response_rules"], [])
+        original_summary = MODULE.PROTOCOL_SUMMARY
+        try:
+            MODULE.PROTOCOL_SUMMARY = summary
+            self.assertEqual(MODULE.numeric_response_label("EASI", 18.0, 9.0), "")
+            self.assertEqual(MODULE.numeric_response_label("IGA", 3.0, 1.0), "")
+        finally:
+            MODULE.PROTOCOL_SUMMARY = original_summary
+
     def test_build_without_finding_hides_finding_ui(self) -> None:
         os.remove(self.project_dir / "demo_finding.xlsx")
         self.run_builder(include_finding=False)

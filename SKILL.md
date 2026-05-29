@@ -1,6 +1,6 @@
 ---
 name: clinical-patient-profile-html
-description: Trigger this skill when the user says “制作patient profile”, “patient profile”, “制作受试者画像”, “制作个例profile”, or asks to build subject-level or center-level clinical patient profile HTML from uploaded listings, protocol files, and finding trackers. The skill must read the protocol first, deconstruct primary and secondary endpoints plus the study flow table, decide which efficacy variables to include and whether they are continuous or binary, ask up front whether to include all subjects or randomized subjects only and whether to include USV data, then inspect uploaded files, stop on blocking or ambiguous mappings, and otherwise proceed directly to generate an offline interactive Chinese HTML patient profile plus supporting CSV outputs.
+description: Trigger this skill when the user says “制作patient profile”, “patient profile”, “制作受试者画像”, “制作个例profile”, or asks to build subject-level or center-level clinical patient profile HTML from uploaded listings, protocol files, and finding trackers. The skill must read the protocol first, deconstruct primary and secondary endpoints plus the study flow table, decide which efficacy variables to include, whether they are continuous or binary, and whether the protocol explicitly defines any responder rules; if a responder rule is not clearly defined and computable, do not force one. Ask up front whether to include all subjects or randomized subjects only and whether to include USV data, then inspect uploaded files, stop on blocking or ambiguous mappings, and otherwise proceed directly to generate an offline interactive Chinese HTML patient profile plus supporting CSV outputs.
 ---
 
 # Clinical Patient Profile HTML
@@ -95,6 +95,7 @@ Use the prompt patterns in `references/mapping_and_decisions.md`.
 ## Adaptation Rules
 
 This skill ships with a working builder that reproduces the current patient-profile style closely, but efficacy identification must be protocol-driven rather than copied from a prior project.
+Responder or response labels must also be protocol-driven: only emit them when the current protocol explicitly defines a rule and the available data can calculate it. Otherwise leave the response field blank.
 
 Prefer updating `suggested_project_config.json` before editing Python.
 

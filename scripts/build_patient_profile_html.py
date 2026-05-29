@@ -423,7 +423,7 @@ def classify_endpoint_role(line: str) -> str:
 
 def classify_variable_type(endpoint_text: str) -> str:
     text = clean_text(endpoint_text).lower()
-    if any(token in text for token in ["应答", "达标", "比例", "率", "proportion", "respond", "responder", "达到", "0/1", "75", "90", "50"]):
+    if any(token in text for token in ["应答", "达标", "比例", "率", "proportion", "respond", "responder", "达到", "0/1"]):
         return "binary"
     if any(token in text for token in ["变化", "change", "平均", "均值", "中位数", "评分", "score", "总分", "百分比变化", "reduction"]):
         return "continuous"
@@ -439,6 +439,147 @@ def metric_matches_protocol(metric: str, line: str) -> bool:
         return True
     aliases = next((item.get("aliases", []) for item in ENDPOINT_METRIC_CATALOG if item["metric"] == metric), [])
     return any(clean_text(alias).lower() in text.lower() for alias in aliases if clean_text(alias))
+
+
+def contains_response_signal(text: str) -> bool:
+    lowered = clean_text(text).lower()
+    return any(
+        token in lowered
+        for token in [
+            "应答",
+            "响应",
+            "responder",
+            "respond",
+            "比例",
+            "率",
+            "达到",
+            "达标",
+            "改善",
+            "缓解",
+            "减轻",
+            "下降",
+            "降低",
+            "减少",
+            "恢复",
+            "0/1",
+            "0或1",
+        ]
+    )
+
+
+def build_response_rule_label(metric: str, rule_type: str, current_max: float | None, improvement_abs: float | None, reduction_pct: float | None, explicit_label: str = "") -> str:
+    explicit = clean_text(explicit_label)
+    if explicit:
+        return explicit
+    metric_name = clean_text(metric)
+    if rule_type == "reduction_pct" and reduction_pct is not None:
+        whole = int(reduction_pct) if float(reduction_pct).is_integer() else reduction_pct
+        if metric_name:
+            return f"{metric_name}改善≥{whole}%"
+        return f"改善≥{whole}%"
+    if rule_type == "improvement_abs" and improvement_abs is not None:
+        whole = int(improvement_abs) if float(improvement_abs).is_integer() else improvement_abs
+        if metric_name:
+            return f"{metric_name}改善≥{whole}分"
+        return f"改善≥{whole}分"
+    if rule_type == "current_lte" and current_max is not None:
+        whole = int(current_max) if float(current_max).is_integer() else current_max
+        if current_max == 1:
+            return f"{metric_name} 0/1分" if metric_name else "0/1分"
+        return f"{metric_name}≤{whole}分" if metric_name else f"≤{whole}分"
+    if rule_type == "current_lte_and_improve_abs" and current_max is not None and improvement_abs is not None:
+        current_whole = int(current_max) if float(current_max).is_integer() else current_max
+        improve_whole = int(improvement_abs) if float(improvement_abs).is_integer() else improvement_abs
+        if current_max == 1:
+            prefix = f"{metric_name} 0/1分" if metric_name else "0/1分"
+        else:
+            prefix = f"{metric_name}≤{current_whole}分" if metric_name else f"≤{current_whole}分"
+        return f"{prefix}且较基线改善≥{improve_whole}分"
+    return ""
+
+
+def parse_response_rules_from_line(line: str, metric: str, endpoint_role: str) -> list[dict[str, Any]]:
+    text = clean_text(line)
+    if not text or not contains_response_signal(text):
+        return []
+
+    metric_name = clean_text(metric)
+    rules: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+
+    def add_rule(rule_type: str, *, current_max: float | None = None, improvement_abs: float | None = None, reduction_pct: float | None = None, explicit_label: str = "") -> None:
+        label = build_response_rule_label(metric_name, rule_type, current_max, improvement_abs, reduction_pct, explicit_label)
+        if not label or label in seen_labels:
+            return
+        seen_labels.add(label)
+        rules.append(
+            {
+                "rule_key": f"{metric_name}|{label}",
+                "metric": metric_name,
+                "label": label,
+                "endpoint_role": endpoint_role,
+                "variable_type": "binary",
+                "rule_type": rule_type,
+                "current_max": current_max,
+                "improvement_abs": improvement_abs,
+                "reduction_pct": reduction_pct,
+                "source_excerpt": text[:220],
+            }
+        )
+
+    upper_text = text.upper()
+    explicit_pct_labels = re.findall(rf"{re.escape(metric_name.upper())}\s*[- ]\s*(\d{{1,3}})", upper_text)
+    for pct_token in explicit_pct_labels:
+        pct_value = float(pct_token)
+        if 0 < pct_value <= 100:
+            add_rule("reduction_pct", reduction_pct=pct_value, explicit_label=f"{metric_name}-{int(pct_value)}")
+
+    percent_match = re.search(r"(?:改善|下降|降低|减少|缓解)(?:至少|不低于|大于等于|≥|>|达)?\s*(\d{1,3}(?:\.\d+)?)\s*%", text)
+    if percent_match:
+        pct_value = float(percent_match.group(1))
+        if 0 < pct_value <= 100:
+            add_rule("reduction_pct", reduction_pct=pct_value)
+
+    improvement_match = re.search(r"(?:改善|下降|降低|减少|缓解)(?:至少|不低于|大于等于|≥|>|达)?\s*(\d+(?:\.\d+)?)\s*分", text)
+    improvement_value = float(improvement_match.group(1)) if improvement_match else None
+    if improvement_value is not None:
+        add_rule("improvement_abs", improvement_abs=improvement_value)
+
+    current_range_match = re.search(
+        r"(?:评分?|score)?(?:为|达到|≤|小于等于)\s*(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:或|/|至|-|~)\s*(\d+(?:\.\d+)?)\s*分",
+        text,
+        re.I,
+    )
+    current_single_match = re.search(r"(?:评分?|score)?(?:为|达到|≤|小于等于)\s*(\d+(?:\.\d+)?)\s*分", text, re.I)
+    current_max = None
+    explicit_current_label = ""
+    if current_range_match:
+        first_value = float(current_range_match.group(1))
+        second_value = float(current_range_match.group(2))
+        current_max = max(first_value, second_value)
+        if {first_value, second_value} == {0.0, 1.0}:
+            explicit_current_label = f"{metric_name} 0/1分"
+    elif current_single_match:
+        current_max = float(current_single_match.group(1))
+
+    if "iga-ts" in text.lower():
+        add_rule(
+            "current_lte_and_improve_abs",
+            current_max=current_max if current_max is not None else 1.0,
+            improvement_abs=improvement_value if improvement_value is not None else 2.0,
+            explicit_label="IGA-TS",
+        )
+    else:
+        if current_max is not None and improvement_value is not None:
+            add_rule(
+                "current_lte_and_improve_abs",
+                current_max=current_max,
+                improvement_abs=improvement_value,
+            )
+        elif current_max is not None:
+            add_rule("current_lte", current_max=current_max, explicit_label=explicit_current_label)
+
+    return rules
 
 
 def normalize_phase_name(text: str) -> str:
@@ -602,16 +743,8 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
                     "source_excerpt": line[:220],
                 }
             )
-        for rule in RESPONSE_RULE_CATALOG:
-            if any(re.search(pattern, line, re.I) for pattern in rule["patterns"]):
-                response_rules[rule["rule_key"]] = {
-                    "rule_key": rule["rule_key"],
-                    "metric": rule["metric"],
-                    "label": rule["label"],
-                    "endpoint_role": classify_endpoint_role(line),
-                    "variable_type": "binary",
-                    "source_excerpt": line[:220],
-                }
+            for rule in parse_response_rules_from_line(line, metric, endpoint_role):
+                response_rules[rule["rule_key"]] = rule
 
     baseline_rules = detect_protocol_baseline_rules(lines, assessment_set)
     for phase in baseline_rules.pop("phase_candidates", []):
@@ -901,7 +1034,7 @@ DEFAULT_EFFICACY_CONFIG = [
         "value_candidates": ["IGA得分", "结果值", "评分"],
         "date_col": "评估日期",
         "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["是否达到IGA-TS？（系统生成）"],
+        "detail_fields": [],
         "aggregate": "single",
     },
     {
@@ -1107,58 +1240,6 @@ GENERIC_EFFICACY_RULES = [
         "group": "PRO",
         "aggregate": "visit",
         "default_variable_type": "continuous",
-    },
-]
-
-RESPONSE_RULE_CATALOG = [
-    {
-        "rule_key": "EASI75",
-        "metric": "EASI",
-        "label": "EASI-75",
-        "patterns": [r"EASI[\s\-]?75", r"EASI.*75%"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "EASI90",
-        "metric": "EASI",
-        "label": "EASI-90",
-        "patterns": [r"EASI[\s\-]?90", r"EASI.*90%"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "IGA_TS",
-        "metric": "IGA",
-        "label": "IGA-TS",
-        "patterns": [r"IGA[\s\-]?TS", r"IGA.*0.?1.*改善.?2", r"vIGA.?AD 0.?1"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "IGA_01",
-        "metric": "IGA",
-        "label": "IGA 0/1分",
-        "patterns": [r"IGA.*0.?1", r"IGA 0/1", r"vIGA.?AD 0.?1"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "NRS4",
-        "metric": "NRS",
-        "label": "Itch NRS改善≥4分",
-        "patterns": [r"NRS.*改善.?≥?4", r"itch nrs.*4", r"pruritus nrs.*4"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "PROMIS8A_6",
-        "metric": "QSI-PROMIS睡眠相关影响8a",
-        "label": "PROMIS-8a临床意义改善",
-        "patterns": [r"PROMIS.*8a.*改善.?≥?6", r"睡眠相关影响8a.*改善.?≥?6", r"PROMIS.*8a"],
-        "variable_type": "binary",
-    },
-    {
-        "rule_key": "PROMIS8B_6",
-        "metric": "QSI-PROMIS睡眠困扰8b",
-        "label": "PROMIS-8b临床意义改善",
-        "patterns": [r"PROMIS.*8b.*改善.?≥?6", r"睡眠困扰8b.*改善.?≥?6", r"PROMIS.*8b"],
-        "variable_type": "binary",
     },
 ]
 
@@ -1568,21 +1649,11 @@ def aggregate_binary_by_visit_group(
 
 def response_label_matches(response_label: Any, response_name: str) -> bool:
     label = clean_text(response_label)
-    if not label or label == MISSING_TEXT:
+    target = clean_text(response_name)
+    if not label or label == MISSING_TEXT or not target:
         return False
-    if response_name == "EASI-75":
-        return "EASI-75" in label
-    if response_name == "EASI-90":
-        return "EASI-90" in label
-    if response_name == "IGA-TS":
-        return "IGA-TS" in label
-    if response_name == "IGA 0/1分":
-        return "IGA 0/1分" in label
-    if response_name == "Itch NRS改善≥4分":
-        return label == "Itch NRS改善≥4分"
-    if response_name in {"PROMIS-8a临床意义改善", "PROMIS-8b临床意义改善"}:
-        return label == response_name
-    return False
+    parts = [clean_text(part) for part in re.split(r"[；;/]", label) if clean_text(part)]
+    return target in parts
 
 
 def build_center_profile_summary(subject_rows: list[dict[str, Any]], center: str) -> dict[str, Any]:
@@ -1873,7 +1944,9 @@ def infer_data_type(field_name: str) -> str:
     raw = clean_text(field_name)
     if "日期" in name or "时间" in raw:
         return "日期/时间"
-    if any(x in raw for x in ["得分", "评分", "下限", "上限", "年龄", "次数", "BSA", "EASI", "SCORAD"]):
+    efficacy_tokens = {clean_text(item["metric"]) for item in ENDPOINT_METRIC_CATALOG}
+    efficacy_tokens.update(clean_text(alias) for item in ENDPOINT_METRIC_CATALOG for alias in item.get("aliases", []))
+    if any(x in raw for x in ["得分", "评分", "下限", "上限", "年龄", "次数"]) or any(token and token.lower() in raw.lower() for token in efficacy_tokens):
         return "数值/文本混合"
     if "是否" in raw:
         return "布尔/枚举"
@@ -1892,7 +1965,9 @@ def needs_manual_review(field_name: str) -> bool:
 
 def infer_sheet_category(sheet_name: str) -> str:
     name = clean_text(sheet_name)
-    if any(x in name for x in ["EASI", "BSA", "SCORAD", "DLQI", "CDLQI", "NRS", "PROMIS", "IGA"]):
+    efficacy_tokens = {clean_text(item["metric"]) for item in ENDPOINT_METRIC_CATALOG}
+    efficacy_tokens.update(clean_text(alias) for item in ENDPOINT_METRIC_CATALOG for alias in item.get("aliases", []))
+    if any(token and token.lower() in name.lower() for token in efficacy_tokens):
         return "疗效"
     if "实验室检查" in name or name.startswith("LB"):
         return "实验室"
@@ -2460,37 +2535,34 @@ def build_ae_rows() -> list[dict[str, Any]]:
 
 def numeric_response_label(metric: str, baseline: float | None, current: float | None) -> str:
     if baseline is None or current is None:
-        return MISSING_TEXT
-    selected_labels = {item["label"] for item in selected_response_rules_for_metric(metric)}
-    labels: list[str] = []
-    if metric == "EASI":
-        reduction = (baseline - current) / baseline * 100 if baseline else None
-        if reduction is None:
-            return MISSING_TEXT
-        threshold_map = [(90, "EASI-90"), (75, "EASI-75"), (50, "EASI-50")]
-        for threshold, label in threshold_map:
-            if label in selected_labels and reduction >= threshold:
-                labels.append(label)
-        return " / ".join(labels) if labels else MISSING_TEXT
-    if metric == "IGA":
-        if current in {0, 1}:
-            if "IGA-TS" in selected_labels and (baseline - current) >= 2:
-                labels.append("IGA-TS")
-            if "IGA 0/1分" in selected_labels:
-                labels.append("IGA 0/1分")
-        return "；".join(labels) if labels else MISSING_TEXT
-    if metric == "NRS":
-        diff = baseline - current
-        if "Itch NRS改善≥4分" in selected_labels and diff >= 4:
-            return "Itch NRS改善≥4分"
-        return MISSING_TEXT
-    if metric in {"QSI-PROMIS睡眠相关影响8a", "QSI-PROMIS睡眠困扰8b"}:
-        diff = baseline - current
-        label = "PROMIS-8a临床意义改善" if metric.endswith("8a") else "PROMIS-8b临床意义改善"
-        if label in selected_labels and diff >= 6:
-            return label
-        return MISSING_TEXT
-    return MISSING_TEXT
+        return ""
+    matched_labels: list[str] = []
+    for rule in selected_response_rules_for_metric(metric):
+        rule_type = clean_text(rule.get("rule_type"))
+        reduction_pct = to_float(rule.get("reduction_pct"))
+        improvement_abs = to_float(rule.get("improvement_abs"))
+        current_max = to_float(rule.get("current_max"))
+        label = clean_text(rule.get("label"))
+        if not label:
+            continue
+        if rule_type == "reduction_pct":
+            if baseline > 0 and reduction_pct is not None:
+                reduction = (baseline - current) / baseline * 100
+                if reduction >= reduction_pct:
+                    matched_labels.append(label)
+            continue
+        if rule_type == "improvement_abs":
+            if improvement_abs is not None and (baseline - current) >= improvement_abs:
+                matched_labels.append(label)
+            continue
+        if rule_type == "current_lte":
+            if current_max is not None and current <= current_max:
+                matched_labels.append(label)
+            continue
+        if rule_type == "current_lte_and_improve_abs":
+            if current_max is not None and improvement_abs is not None and current <= current_max and (baseline - current) >= improvement_abs:
+                matched_labels.append(label)
+    return "；".join(unique(matched_labels))
 
 
 def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> list[dict[str, Any]]:
@@ -2548,7 +2620,7 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
                 "数值结果": numeric_value,
                 "较基线变化": MISSING_TEXT,
                 "较基线百分比变化": MISSING_TEXT,
-                "关键应答判定": MISSING_TEXT,
+                "关键应答判定": "",
                 "数据来源sheet": config["sheet"],
                 "原始字段名": config["value_col"],
                 "是否存在缺失、重复、异常日期或访视窗问题": "是" if note_parts else "否",
