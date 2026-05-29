@@ -913,8 +913,9 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path]) -> dict[str, An
     if baseline_rules.get("has_early_exit"):
         phase_set.add("提前退出")
 
-    summary["selected_metrics"] = sorted(detected_metrics.values(), key=lambda item: efficacy_sort_key(item["metric"]))
-    summary["response_rules"] = sorted(response_rules.values(), key=lambda item: (efficacy_sort_key(item["metric"]), item["label"]))
+    summary["selected_metrics"] = list(detected_metrics.values())
+    metric_order = {clean_text(item.get("metric")): idx + 1 for idx, item in enumerate(summary["selected_metrics"])}
+    summary["response_rules"] = sorted(response_rules.values(), key=lambda item: (metric_order.get(clean_text(item.get("metric")), 999), item["label"]))
     summary["visit_mentions"] = sorted(unique(summary["visit_mentions"]))
     if "安全性随访期" in phase_set and "随访期" in phase_set:
         phase_set.discard("随访期")
@@ -1180,16 +1181,6 @@ LAB_METRIC_ORDER = {
     "GLU": 401, "CK": 402, "LDH": 403, "QTc间期": 500,
 }
 
-EFFICACY_METRIC_ORDER = {
-    "IGA": 1,
-    "EASI": 2,
-    "BSA": 3,
-    "DLQI": 4,
-    "CDLQI": 5,
-    "SCORAD": 6,
-    "NRS": 7,
-}
-
 VITAL_METRIC_ORDER = {
     "体温": 1,
     "心率": 2,
@@ -1265,7 +1256,7 @@ def parse_embedded_numeric(value: Any) -> float | None:
 def efficacy_sort_key(metric_name: str) -> tuple[int, str]:
     name = clean_text(metric_name)
     protocol_order = {clean_text(item.get("metric")): idx + 1 for idx, item in enumerate(PROTOCOL_SUMMARY.get("selected_metrics", []))}
-    return (protocol_order.get(name, EFFICACY_METRIC_ORDER.get(name, 999)), name)
+    return (protocol_order.get(name, 999), name)
 
 
 def vital_sort_key(metric_name: str) -> tuple[int, str]:

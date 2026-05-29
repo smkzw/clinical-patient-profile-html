@@ -265,6 +265,7 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         labels = {item["label"] for item in summary["response_rules"]}
         self.assertIn("EASI-75", labels)
         self.assertIn("IGA-TS", labels)
+        self.assertEqual([item["metric"] for item in summary["selected_metrics"][:2]], ["EASI", "IGA"])
 
     def test_no_protocol_response_definition_keeps_response_blank(self) -> None:
         protocol_path = self.project_dir / "only_continuous.txt"
@@ -313,6 +314,22 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertEqual(summary["selected_metrics"][0]["metric"], "NSS")
         self.assertEqual(configs[0]["metric"], "NSS")
         self.assertEqual(configs[0]["sheet"], "NSS--鼻部症状综合评分")
+
+    def test_protocol_metric_order_follows_endpoint_appearance(self) -> None:
+        protocol_path = self.project_dir / "order_metric.txt"
+        protocol_path.write_text(
+            "\n".join(
+                [
+                    "研究方案",
+                    "主要终点：第15天 IGA 评分变化。",
+                    "关键次要终点：第15天 EASI 评分较基线变化。",
+                    "次要终点：第15天 DLQI 评分变化。",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        summary = MODULE.detect_protocol_endpoint_summary([protocol_path])
+        self.assertEqual([item["metric"] for item in summary["selected_metrics"]], ["IGA", "EASI", "DLQI"])
 
     def test_build_without_finding_hides_finding_ui(self) -> None:
         os.remove(self.project_dir / "demo_finding.xlsx")
