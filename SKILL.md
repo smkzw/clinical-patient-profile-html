@@ -95,6 +95,7 @@ Use the prompt patterns in `references/mapping_and_decisions.md`.
 ## Adaptation Rules
 
 This skill ships with a working builder that reproduces the current patient-profile style closely, but efficacy identification must be protocol-driven rather than copied from a prior project.
+Metric aliases and candidate efficacy names must also be derived from the current protocol wording, especially the primary/secondary endpoint text and the study flow table, rather than from a hardcoded disease-specific alias catalog.
 Responder or response labels must also be protocol-driven: only emit them when the current protocol explicitly defines a rule and the available data can calculate it. Otherwise leave the response field blank.
 
 Prefer updating `suggested_project_config.json` before editing Python.

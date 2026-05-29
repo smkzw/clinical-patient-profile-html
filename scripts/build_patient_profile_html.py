@@ -315,38 +315,58 @@ def detect_sheet_aliases(path: Path) -> dict[str, str]:
     return aliases
 
 
-def detect_efficacy_config(path: Path) -> list[dict[str, Any]]:
+def detect_efficacy_config(path: Path, protocol_summary: dict[str, Any]) -> list[dict[str, Any]]:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         sheet_names = wb.sheetnames[:]
     finally:
         wb.close()
+    selected_metrics = protocol_summary.get("selected_metrics", [])
+    if not selected_metrics:
+        return []
+
+    excluded_patterns = [r"^DM", r"^SV", r"^SUBJ", r"^RAND", r"^IC", r"^AE", r"^VS", r"^EG", r"^LB", r"^DS", r"^PC"]
+    candidate_sheet_names = [name for name in sheet_names if not any(re.search(pattern, name, re.I) for pattern in excluded_patterns)]
+    generic_value_candidates = ["总分", "合计评分", "评分", "得分", "平均评分", "平均值", "结果值", "数值结果"]
+    generic_date_candidates = ["评估日期", "日期", "访视日期", "评估日期(RESDAT)", "RESDAT"]
     configs: list[dict[str, Any]] = []
-    for rule in GENERIC_EFFICACY_RULES:
-        matched_sheets = [name for name in sheet_names if score_sheet_name(name, rule.get("sheet_patterns", [])) > 0]
-        for sheet_name in matched_sheets:
+
+    for metric_spec in selected_metrics:
+        metric = clean_text(metric_spec.get("metric"))
+        aliases = unique([metric, *metric_spec.get("aliases", [])])
+        best_match: dict[str, Any] | None = None
+        best_score = 0
+        for sheet_name in candidate_sheet_names:
             sheet = read_listing_sheet(path, sheet_name)
             headers = sheet["headers"]
-            chosen_value_col = find_matching_header(headers, rule.get("value_candidates", []))
+            score = score_protocol_metric_sheet_match(sheet_name, headers, aliases)
+            if score <= 0:
+                continue
+            value_candidates = build_metric_value_candidates(metric, aliases)
+            chosen_value_col = find_matching_header(headers, value_candidates + generic_value_candidates)
             if not chosen_value_col:
                 continue
-            chosen_date_col = find_matching_header(headers, rule.get("date_candidates", []))
+            chosen_date_col = find_matching_header(headers, build_metric_date_candidates(metric, aliases) + generic_date_candidates)
+            aggregate = infer_metric_aggregate(sheet_name, headers)
             resolved = {
                 "sheet": sheet_name,
-                "sheet_patterns": rule.get("sheet_patterns", []),
-                "metric": rule["metric"],
-                "group": rule.get("group", "疗效"),
-                "value_col": chosen_value_col or (rule.get("value_candidates") or [""])[0],
-                "date_col": chosen_date_col or (rule.get("date_candidates") or [""])[0],
+                "sheet_patterns": [],
+                "metric": metric,
+                "group": infer_metric_group(metric, aliases),
+                "value_col": chosen_value_col or value_candidates[0],
+                "date_col": chosen_date_col or generic_date_candidates[0],
                 "value_col_confirmed": bool(chosen_value_col),
                 "date_col_confirmed": bool(chosen_date_col),
-                "aggregate": rule.get("aggregate", "visit"),
-                "default_variable_type": rule.get("default_variable_type", "continuous"),
-                "aliases": rule.get("aliases", []),
-                "value_parser": rule.get("value_parser", "float"),
+                "aggregate": aggregate,
+                "default_variable_type": metric_spec.get("default_variable_type", "continuous"),
+                "aliases": aliases,
+                "value_parser": "embedded_numeric",
             }
-            if not any(item["sheet"] == sheet_name and item["metric"] == rule["metric"] for item in configs):
-                configs.append(resolved)
+            if score > best_score:
+                best_match = resolved
+                best_score = score
+        if best_match:
+            configs.append(best_match)
     return configs
 
 
@@ -430,15 +450,155 @@ def classify_variable_type(endpoint_text: str) -> str:
     return "需确认"
 
 
-def metric_matches_protocol(metric: str, line: str) -> bool:
+PROTOCOL_METRIC_KEYWORDS = ("评分", "量表", "问卷", "指数", "症状", "总分", "生活质量")
+PROTOCOL_METRIC_STOPWORDS = {
+    "primary",
+    "secondary",
+    "endpoint",
+    "efficacy",
+    "study",
+    "visit",
+    "screening",
+    "baseline",
+    "randomization",
+    "protocol",
+    "score",
+    "safety",
+}
+
+
+def normalize_metric_token(text: Any) -> str:
+    token = clean_text(text).strip("•·-:：,，;；。()（）[]【】")
+    token = re.sub(r"\s+", " ", token)
+    return token
+
+
+def sanitize_metric_phrase(text: Any) -> str:
+    phrase = normalize_metric_token(text)
+    phrase = re.sub(r"^(?:第?\d+天|D-?\d+(?:和D-?\d+)*|W\d+(?:和W\d+)*)", "", phrase, flags=re.I)
+    phrase = re.sub(r"^(?:进行|完成|采用|使用|达到|评估|记录|比较|观察)+", "", phrase)
+    phrase = re.sub(r"^(?:和|及|与|的)+", "", phrase)
+    return normalize_metric_token(phrase)
+
+
+def is_protocol_metric_token(token: str) -> bool:
+    text = sanitize_metric_phrase(token)
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in PROTOCOL_METRIC_STOPWORDS:
+        return False
+    if re.fullmatch(r"[DVW]\d+(?:±\d+d)?", text, re.I) or text in {"SCR", "USV"}:
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)?%?", text):
+        return False
+    if len(text) <= 1:
+        return False
+    if any(keyword in text for keyword in PROTOCOL_METRIC_KEYWORDS):
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9\-\(\)/]{1,20}", text):
+        return True
+    return False
+
+
+def extract_protocol_metric_candidates(line: str) -> list[dict[str, Any]]:
     text = clean_text(line)
-    if metric in text:
-        return True
-    metric_upper = metric.upper()
-    if metric_upper and metric_upper in text.upper():
-        return True
-    aliases = next((item.get("aliases", []) for item in ENDPOINT_METRIC_CATALOG if item["metric"] == metric), [])
-    return any(clean_text(alias).lower() in text.lower() for alias in aliases if clean_text(alias))
+    if not text:
+        return []
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def add_candidate(metric: str, aliases: list[str] | None = None) -> None:
+        metric_name = sanitize_metric_phrase(metric)
+        if not is_protocol_metric_token(metric_name):
+            return
+        alias_values = [metric_name, *(aliases or [])]
+        for existing_metric, existing_entry in candidates.items():
+            existing_aliases = set(existing_entry.get("aliases", []))
+            normalized_aliases = {sanitize_metric_phrase(alias) for alias in alias_values if sanitize_metric_phrase(alias)}
+            if metric_name in existing_aliases or existing_metric in normalized_aliases:
+                entry = existing_entry
+                break
+        else:
+            entry = candidates.setdefault(metric_name, {"metric": metric_name, "aliases": []})
+        for alias in alias_values:
+            normalized = sanitize_metric_phrase(alias)
+            if normalized and normalized not in entry["aliases"]:
+                entry["aliases"].append(normalized)
+
+    for match in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9、/·\-]+?(?:评分|量表|问卷|指数|总症状评分|总分|生活质量问卷))[（(]([A-Za-z][A-Za-z0-9\-\(\)/]{1,20})[）)]", text):
+        add_candidate(match.group(2), [match.group(1)])
+
+    if contains_response_signal(text):
+        for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9]{1,20})-(\d{1,3}|TS)\b", text, re.I):
+            add_candidate(match.group(1), [match.group(0)])
+
+    for match in re.finditer(r"([A-Za-z][A-Za-z0-9\-\(\)]{1,15}(?:/[A-Za-z][A-Za-z0-9\-\(\)]{1,15})+)", text):
+        for token in match.group(1).split("/"):
+            add_candidate(token)
+
+    for match in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9、/·\-]{2,40}?(?:评分|量表|问卷|指数|总症状评分|总分|生活质量问卷))", text):
+        if "（" in match.group(0) or "(" in match.group(0):
+            continue
+        add_candidate(match.group(1))
+
+    for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9\-\(\)/]{1,20})\b", text):
+        add_candidate(match.group(1))
+
+    return list(candidates.values())
+
+
+def score_protocol_metric_sheet_match(sheet_name: str, headers: list[str], aliases: list[str]) -> int:
+    score = 0
+    sheet_text = clean_text(sheet_name).lower()
+    header_texts = [clean_text(header).lower() for header in headers if clean_text(header)]
+    for alias in aliases:
+        alias_text = clean_text(alias).lower()
+        if not alias_text:
+            continue
+        if alias_text in sheet_text:
+            score += 6
+        for header in header_texts:
+            if alias_text in header:
+                score += 3
+    return score
+
+
+def build_metric_value_candidates(metric: str, aliases: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for token in unique([metric, *aliases]):
+        if not token:
+            continue
+        candidates.extend(
+            [
+                f"{token}得分",
+                f"{token}评分",
+                f"{token}总分",
+                f"{token}结果",
+                f"{token}结果值",
+                token,
+            ]
+        )
+    candidates.extend(["合计评分", "总分", "评分", "得分", "平均评分", "平均值", "结果值", "数值结果"])
+    return unique(candidates)
+
+
+def build_metric_date_candidates(metric: str, aliases: list[str]) -> list[str]:
+    return unique(["评估日期", "日期", "访视日期", "评估日期(RESDAT)", "RESDAT", "检查日期"])
+
+
+def infer_metric_group(metric: str, aliases: list[str]) -> str:
+    text = " ".join(unique([metric, *aliases]))
+    if any(token in text for token in ["问卷", "生活质量", "PROMIS", "NRS", "PRO"]):
+        return "PRO"
+    return "疗效"
+
+
+def infer_metric_aggregate(sheet_name: str, headers: list[str]) -> str:
+    header_text = " ".join(clean_text(header) for header in headers)
+    sheet_text = clean_text(sheet_name)
+    if any(token in header_text for token in ["RESDAT", "开始日期", "结束日期"]) or re.search(r"^RES", sheet_text, re.I):
+        return "visit_date"
+    return "visit"
 
 
 def contains_response_signal(text: str) -> bool:
@@ -680,7 +840,7 @@ def detect_protocol_baseline_rules(lines: list[str], required_assessments: set[s
     return rules
 
 
-def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_efficacy: list[dict[str, Any]]) -> dict[str, Any]:
+def detect_protocol_endpoint_summary(protocol_files: list[Path]) -> dict[str, Any]:
     summary = {
         "files": [str(path) for path in protocol_files],
         "endpoint_items": [],
@@ -697,7 +857,6 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
     lines: list[str] = []
     phase_set: set[str] = set()
     assessment_set: set[str] = set()
-    detected_metric_names = {item["metric"] for item in detected_efficacy}
     for path in protocol_files:
         text = read_protocol_file(path)
         if not text:
@@ -719,12 +878,10 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
         line_has_flow = any(keyword in line for keyword in ["研究流程", "流程表", "访视", "评估时间表", "检查项目"])
         if endpoint_role == "未分类" and not line_has_visit and not line_has_flow:
             continue
-        for item in ENDPOINT_METRIC_CATALOG:
+        metric_candidates = extract_protocol_metric_candidates(line)
+        for item in metric_candidates:
             metric = item["metric"]
-            if not metric_matches_protocol(metric, line):
-                continue
-            if metric not in detected_metric_names:
-                continue
+            aliases = item.get("aliases", [])
             variable_type = classify_variable_type(line)
             assessment_set.add("疗效")
             existing = detected_metrics.get(metric)
@@ -732,14 +889,18 @@ def detect_protocol_endpoint_summary(protocol_files: list[Path], detected_effica
                 detected_metrics[metric] = {
                     "metric": metric,
                     "endpoint_role": endpoint_role,
-                    "variable_type": variable_type if variable_type != "需确认" else item.get("default_variable_type", "continuous"),
+                    "variable_type": variable_type if variable_type != "需确认" else "continuous",
+                    "aliases": aliases,
                     "source_excerpt": line[:220],
                 }
+            elif aliases:
+                existing["aliases"] = unique(existing.get("aliases", []) + aliases)
             summary["endpoint_items"].append(
                 {
                     "metric": metric,
                     "endpoint_role": endpoint_role,
                     "variable_type": variable_type,
+                    "aliases": aliases,
                     "source_excerpt": line[:220],
                 }
             )
@@ -887,8 +1048,8 @@ def configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
     REF_HTMLS = ref_htmls
 
     SHEET_ALIASES = detect_sheet_aliases(LISTING_XLSX) if LISTING_XLSX.exists() else {alias: "" for alias in CORE_SHEET_CATALOG}
-    detected_efficacy = detect_efficacy_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
-    PROTOCOL_SUMMARY = detect_protocol_endpoint_summary(PROTOCOL_FILES, detected_efficacy)
+    PROTOCOL_SUMMARY = detect_protocol_endpoint_summary(PROTOCOL_FILES)
+    detected_efficacy = detect_efficacy_config(LISTING_XLSX, PROTOCOL_SUMMARY) if LISTING_XLSX.exists() else []
     STUDY_PHASES = PROTOCOL_SUMMARY.get("study_phases", [])[:]
     EFFICACY_CONFIG = select_efficacy_config_by_protocol(detected_efficacy, PROTOCOL_SUMMARY)
     LAB_CONFIG = detect_lab_config(LISTING_XLSX) if LISTING_XLSX.exists() else []
@@ -988,278 +1149,13 @@ DISPLAY_FIELD_KEYWORDS = (
     "备注",
 )
 
-DEFAULT_EFFICACY_CONFIG = [
-    {
-        "sheet": "EASI--湿疹面积及严重程度指数评分（EASI）",
-        "sheet_patterns": [r"\bEASI\b", r"湿疹面积及严重程度指数"],
-        "metric": "EASI",
-        "group": "疗效",
-        "value_col": "EASI得分（4个部位的评分总和）",
-        "value_candidates": ["EASI得分（4个部位的评分总和）", "EASI得分", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["部位", "该部位BSA结果（系统生成）", "皮损累及面积评分", "红斑", "水肿/丘疹", "表皮脱落", "苔藓样变"],
-        "aggregate": "total_with_details",
-    },
-    {
-        "sheet": "BSA--受累体表面积（BSA）",
-        "sheet_patterns": [r"\bBSA\b", r"受累体表面积"],
-        "metric": "BSA",
-        "group": "疗效",
-        "value_col": "BSA结果（4个部位的评分总和）",
-        "value_candidates": ["BSA结果（4个部位的评分总和）", "BSA结果", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["部位", "BSA结果"],
-        "aggregate": "total_with_details",
-    },
-    {
-        "sheet": "SR--特应性皮炎评分（SCORAD）-最后分值",
-        "sheet_patterns": [r"SCORAD", r"最后分值"],
-        "metric": "SCORAD",
-        "group": "疗效",
-        "value_col": "最后分值",
-        "value_candidates": ["最后分值", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": [],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "IGA--研究者整体评分（IGA）",
-        "sheet_patterns": [r"\bIGA\b", r"研究者整体评分"],
-        "metric": "IGA",
-        "group": "疗效",
-        "value_col": "IGA得分",
-        "value_candidates": ["IGA得分", "结果值", "评分"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": [],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "DLQI--皮肤病生活质量指数（DLQI）",
-        "sheet_patterns": [r"\bDLQI\b", r"皮肤病生活质量指数"],
-        "metric": "DLQI",
-        "group": "PRO",
-        "value_col": "合计评分（系统生成）",
-        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": [],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "CDLQI--儿童皮肤病生活质量指数（CDLQI）",
-        "sheet_patterns": [r"\bCDLQI\b", r"儿童皮肤病生活质量指数"],
-        "metric": "CDLQI",
-        "group": "PRO",
-        "value_col": "合计评分（系统生成）",
-        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": [],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "NRS--瘙痒数值评定量表（Itch NRS）-平均值",
-        "sheet_patterns": [r"Itch NRS", r"\bNRS\b", r"瘙痒数值评定量表"],
-        "metric": "NRS",
-        "group": "PRO",
-        "value_col": "平均瘙痒程度",
-        "value_candidates": ["平均瘙痒程度", "平均值", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["开始日期", "结束日期"],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "QSI--PROMIS简表-睡眠相关影响8a-平均值",
-        "sheet_patterns": [r"PROMIS.*8a", r"睡眠相关影响8a"],
-        "metric": "QSI-PROMIS睡眠相关影响8a",
-        "group": "PRO",
-        "value_col": "平均评分",
-        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["开始日期", "结束日期"],
-        "aggregate": "single",
-    },
-    {
-        "sheet": "QSD--PROMIS简表-睡眠困扰8b-平均值",
-        "sheet_patterns": [r"PROMIS.*8b", r"睡眠困扰8b"],
-        "metric": "QSI-PROMIS睡眠困扰8b",
-        "group": "PRO",
-        "value_col": "平均评分",
-        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
-        "date_col": "评估日期",
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "detail_fields": ["开始日期", "结束日期"],
-        "aggregate": "single",
-    },
-]
-
-GENERIC_EFFICACY_RULES = [
-    {
-        "metric": "EASI",
-        "aliases": ["EASI", "湿疹面积及严重程度指数"],
-        "sheet_patterns": [r"\bEASI\b", r"湿疹面积及严重程度指数"],
-        "value_candidates": ["EASI得分（4个部位的评分总和）", "EASI得分", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "疗效",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "IGA",
-        "aliases": ["IGA", "研究者整体评分"],
-        "sheet_patterns": [r"\bIGA\b", r"研究者整体评分"],
-        "value_candidates": ["IGA得分", "结果值", "评分"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "疗效",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-        "value_parser": "iga",
-    },
-    {
-        "metric": "BSA",
-        "aliases": ["BSA", "受累体表面积"],
-        "sheet_patterns": [r"\bBSA\b", r"受累体表面积"],
-        "value_candidates": ["BSA结果（4个部位的评分总和）", "BSA结果", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "疗效",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "SCORAD",
-        "aliases": ["SCORAD", "特应性皮炎评分"],
-        "sheet_patterns": [r"SCORAD", r"最后分值"],
-        "value_candidates": ["最后分值", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "疗效",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "DLQI",
-        "aliases": ["DLQI", "皮肤病生活质量指数"],
-        "sheet_patterns": [r"\bDLQI\b", r"皮肤病生活质量指数"],
-        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "CDLQI",
-        "aliases": ["CDLQI", "儿童皮肤病生活质量指数"],
-        "sheet_patterns": [r"\bCDLQI\b", r"儿童皮肤病生活质量指数"],
-        "value_candidates": ["合计评分（系统生成）", "合计评分", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "NRS",
-        "aliases": ["NRS", "Itch NRS", "瘙痒数值评定量表"],
-        "sheet_patterns": [r"Itch NRS", r"\bNRS\b", r"瘙痒数值评定量表"],
-        "value_candidates": ["平均瘙痒程度", "平均值", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "QSI-PROMIS睡眠相关影响8a",
-        "aliases": ["PROMIS 8a", "睡眠相关影响8a", "QSI"],
-        "sheet_patterns": [r"PROMIS.*8a", r"睡眠相关影响8a"],
-        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "QSI-PROMIS睡眠困扰8b",
-        "aliases": ["PROMIS 8b", "睡眠困扰8b", "QSD"],
-        "sheet_patterns": [r"PROMIS.*8b", r"睡眠困扰8b"],
-        "value_candidates": ["平均评分", "平均值", "总分", "结果值"],
-        "date_candidates": ["评估日期", "日期", "访视日期"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "rTNSS",
-        "aliases": ["rTNSS", "反射性鼻部总症状评分", "鼻部总症状评分"],
-        "sheet_patterns": [r"^RES\d*$", r"^RES\d+$", r"^RES[0-9_]+$"],
-        "value_candidates": ["rTNSS总分(RTNSSNUM)", "rTNSS总分", "RTNSSNUM"],
-        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
-        "group": "疗效",
-        "aggregate": "visit_date",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "iTNSS",
-        "aliases": ["iTNSS", "瞬时鼻部总症状评分"],
-        "sheet_patterns": [r"^RES_?\d+$", r"^RES_1$", r"^RES_2$", r"^RES_[0-9]+$"],
-        "value_candidates": ["iTNSS总分(ITNSSNUM)", "iTNSS总分", "ITNSSNUM"],
-        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
-        "group": "疗效",
-        "aggregate": "visit_date",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "rTOSS",
-        "aliases": ["rTOSS", "反射性眼部总症状评分"],
-        "sheet_patterns": [r"^RES\d*$", r"^RES\d+$", r"^RES[0-9_]+$"],
-        "value_candidates": ["rTOSS总分(RTOSSNUM)", "rTOSS总分", "RTOSSNUM"],
-        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
-        "group": "疗效",
-        "aggregate": "visit_date",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "iTOSS",
-        "aliases": ["iTOSS", "瞬时眼部总症状评分"],
-        "sheet_patterns": [r"^RES_?\d+$", r"^RES_1$", r"^RES_2$", r"^RES_[0-9]+$"],
-        "value_candidates": ["iTOSS总分(ITOSSNUM)", "iTOSS总分", "ITOSSNUM"],
-        "date_candidates": ["评估日期(RESDAT)", "评估日期", "RESDAT"],
-        "group": "疗效",
-        "aggregate": "visit_date",
-        "default_variable_type": "continuous",
-    },
-    {
-        "metric": "RQLQ(s)",
-        "aliases": ["RQLQ", "RQLQ(s)", "生活质量问卷", "鼻结膜炎生活质量问卷"],
-        "sheet_patterns": [r"\bRQL\b", r"RQLQ"],
-        "value_candidates": ["总分(SCTNUM)", "总分", "SCTNUM"],
-        "date_candidates": ["评估日期(RQLDAT)", "评估日期", "RQLDAT"],
-        "group": "PRO",
-        "aggregate": "visit",
-        "default_variable_type": "continuous",
-    },
-]
-
-ENDPOINT_METRIC_CATALOG = [
-    {
-        "metric": spec["metric"],
-        "aliases": spec.get("aliases", [spec["metric"]]),
-        "default_variable_type": spec.get("default_variable_type", "continuous"),
-        "config": spec,
-    }
-    for spec in GENERIC_EFFICACY_RULES
-]
-
 DEFAULT_LAB_CONFIG = [
     {"sheet": "LBHEMA--实验室检查-血常规", "sheet_patterns": [r"^LBHEMA--", r"^LB_HEM$", r"血常规"], "lab_category": "血常规"},
     {"sheet": "LBCHEM--实验室检查-血生化", "sheet_patterns": [r"^LBCHEM--", r"^LB_CHEM$", r"血生化"], "lab_category": "血生化"},
     {"sheet": "LBURIN--实验室检查-尿常规", "sheet_patterns": [r"^LBURIN--", r"^LB_URI$", r"尿常规"], "lab_category": "尿常规"},
 ]
 
-EFFICACY_CONFIG = deepcopy(DEFAULT_EFFICACY_CONFIG)
+EFFICACY_CONFIG: list[dict[str, Any]] = []
 LAB_CONFIG = deepcopy(DEFAULT_LAB_CONFIG)
 SHEET_ALIASES = {alias: "" for alias in CORE_SHEET_CATALOG}
 HTML_TITLE = "受试者Patient Profile"
@@ -1353,19 +1249,23 @@ def to_float(value: Any) -> float | None:
         return None
 
 
-def parse_iga_score(value: Any) -> float | None:
+def parse_embedded_numeric(value: Any) -> float | None:
     text = clean_text(value)
     if not text:
         return None
-    match = re.search(r"(\d+(?:\.\d+)?)\s*分", text)
+    direct = to_float(text)
+    if direct is not None:
+        return direct
+    match = re.search(r"(-?\d+(?:\.\d+)?)", text)
     if match:
         return float(match.group(1))
-    return to_float(text)
+    return None
 
 
 def efficacy_sort_key(metric_name: str) -> tuple[int, str]:
     name = clean_text(metric_name)
-    return (EFFICACY_METRIC_ORDER.get(name, 999), name)
+    protocol_order = {clean_text(item.get("metric")): idx + 1 for idx, item in enumerate(PROTOCOL_SUMMARY.get("selected_metrics", []))}
+    return (protocol_order.get(name, EFFICACY_METRIC_ORDER.get(name, 999)), name)
 
 
 def vital_sort_key(metric_name: str) -> tuple[int, str]:
@@ -1939,13 +1839,22 @@ def normalize_field_name(field_name: str) -> str:
     return raw
 
 
+def known_efficacy_tokens() -> set[str]:
+    tokens = {clean_text(item.get("metric")) for item in PROTOCOL_SUMMARY.get("selected_metrics", []) if clean_text(item.get("metric"))}
+    for item in PROTOCOL_SUMMARY.get("selected_metrics", []):
+        for alias in item.get("aliases", []):
+            alias_text = clean_text(alias)
+            if alias_text:
+                tokens.add(alias_text)
+    return tokens
+
+
 def infer_data_type(field_name: str) -> str:
     name = normalize_field_name(field_name)
     raw = clean_text(field_name)
     if "日期" in name or "时间" in raw:
         return "日期/时间"
-    efficacy_tokens = {clean_text(item["metric"]) for item in ENDPOINT_METRIC_CATALOG}
-    efficacy_tokens.update(clean_text(alias) for item in ENDPOINT_METRIC_CATALOG for alias in item.get("aliases", []))
+    efficacy_tokens = known_efficacy_tokens()
     if any(x in raw for x in ["得分", "评分", "下限", "上限", "年龄", "次数"]) or any(token and token.lower() in raw.lower() for token in efficacy_tokens):
         return "数值/文本混合"
     if "是否" in raw:
@@ -1965,8 +1874,7 @@ def needs_manual_review(field_name: str) -> bool:
 
 def infer_sheet_category(sheet_name: str) -> str:
     name = clean_text(sheet_name)
-    efficacy_tokens = {clean_text(item["metric"]) for item in ENDPOINT_METRIC_CATALOG}
-    efficacy_tokens.update(clean_text(alias) for item in ENDPOINT_METRIC_CATALOG for alias in item.get("aliases", []))
+    efficacy_tokens = known_efficacy_tokens()
     if any(token and token.lower() in name.lower() for token in efficacy_tokens):
         return "疗效"
     if "实验室检查" in name or name.startswith("LB"):
@@ -2586,7 +2494,7 @@ def build_efficacy_rows(visit_index: dict[tuple[str, str], dict[str, str]]) -> l
             first = rows[0]
             metric = config["metric"]
             raw_value = first.get(config["value_col"])
-            numeric_value = parse_iga_score(raw_value) if config.get("value_parser") == "iga" or metric == "IGA" else to_float(raw_value)
+            numeric_value = parse_embedded_numeric(raw_value) if config.get("value_parser") == "embedded_numeric" else to_float(raw_value)
             date_value = grouped_date or parse_date(first.get(config["date_col"])) or visit_index.get((subject, visit_oid), {}).get("访视日期", "")
             duplicate_count = len(rows)
             note_parts = []
@@ -3604,36 +3512,7 @@ def run_qc_checks(
         })
     add_summary("是否存在Finding提到的问题无法定位到对应数据点", len(unlocated_findings) == 0, len(unlocated_findings), "缺少访视或数据点定位信息")
 
-    # 16 adult/child scale mismatch
-    age_lookup = {
-        (r.get("受试者键") or build_subject_key({"中心": r.get("中心", ""), "受试者编号": r.get("受试者编号", "")})): r.get("年龄组", "")
-        for r in subject_rows
-    }
-    scale_mismatch = []
-    for row in efficacy_rows:
-        age_group = age_lookup.get(row.get("受试者键", ""), "")
-        if age_group == "成人" and row.get("指标名称") == "CDLQI":
-            scale_mismatch.append(row)
-        if age_group == "青少年" and row.get("指标名称") == "DLQI":
-            scale_mismatch.append(row)
-    for row in scale_mismatch:
-        issues.append({
-            "issue_id": f"QC-{len(issues)+1:04d}",
-            "issue_type": "年龄组与量表不匹配",
-            "severity": "中",
-            "center": row.get("中心", ""),
-            "subject": row.get("受试者编号", ""),
-            "sheet": row.get("数据来源sheet", ""),
-            "detail": f"{row.get('年龄组','未识别年龄组')} 使用了 {row.get('指标名称','')}，需人工确认量表适用性",
-        })
-    add_summary("是否存在儿童/成人量表使用不一致，例如成人使用CDLQI或儿童使用DLQI", len(scale_mismatch) == 0, len(scale_mismatch), "按年龄组和量表名称比对")
-
-    # 17 SCORAD source
-    preferred_scorad_sheet = next((cfg["sheet"] for cfg in EFFICACY_CONFIG if cfg.get("metric") == "SCORAD"), "")
-    scorad_source_bad = [r for r in efficacy_rows if r.get("指标名称") == "SCORAD" and preferred_scorad_sheet and r.get("数据来源sheet") != preferred_scorad_sheet]
-    add_summary("是否存在SCORAD总分来源不符合要求", len(scorad_source_bad) == 0, len(scorad_source_bad), "SCORAD总分优先来源固定为SR sheet")
-
-    # 18 qualitative urine numeric
+    # 16 qualitative urine numeric
     urine_numeric = [r for r in lab_rows if r.get("实验室类别") == "尿常规" and any(k in r.get("结果值", "") for k in ["+", "阴性", "阳性"]) and r.get("图表模式") == "numeric"]
     for row in urine_numeric:
         issues.append({

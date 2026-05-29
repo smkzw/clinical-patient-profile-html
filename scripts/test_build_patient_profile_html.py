@@ -254,14 +254,14 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
         self.assertEqual(MODULE.simplify_visit_label("SCR", "筛选/导入期V1（D-7~D-1）"), "SCR")
 
     def test_protocol_summary_detects_baseline_and_early_exit(self) -> None:
-        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"])
         self.assertEqual(summary["baseline_rules"]["实验室"]["status"], "confirmed")
         self.assertEqual(summary["baseline_rules"]["心电图"]["status"], "confirmed")
         self.assertEqual(summary["baseline_rules"]["生命体征"]["status"], "confirmed")
         self.assertTrue(summary["baseline_rules"]["has_early_exit"])
 
     def test_protocol_summary_extracts_response_rules_from_protocol_text(self) -> None:
-        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        summary = MODULE.detect_protocol_endpoint_summary([self.project_dir / "研究方案.txt"])
         labels = {item["label"] for item in summary["response_rules"]}
         self.assertIn("EASI-75", labels)
         self.assertIn("IGA-TS", labels)
@@ -278,7 +278,7 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        summary = MODULE.detect_protocol_endpoint_summary([protocol_path], MODULE.detect_efficacy_config(self.project_dir / "demo_listing.xlsx"))
+        summary = MODULE.detect_protocol_endpoint_summary([protocol_path])
         self.assertEqual(summary["response_rules"], [])
         original_summary = MODULE.PROTOCOL_SUMMARY
         try:
@@ -287,6 +287,32 @@ class BuildPatientProfileHtmlTest(unittest.TestCase):
             self.assertEqual(MODULE.numeric_response_label("IGA", 3.0, 1.0), "")
         finally:
             MODULE.PROTOCOL_SUMMARY = original_summary
+
+    def test_detect_efficacy_config_uses_protocol_metrics_not_preset_catalog(self) -> None:
+        protocol_path = self.project_dir / "custom_metric.txt"
+        protocol_path.write_text(
+            "\n".join(
+                [
+                    "研究方案",
+                    "主要终点：第15天 鼻部症状综合评分（NSS）较基线变化。",
+                    "研究流程：D1和D15进行鼻部症状综合评分（NSS）评估。",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        listing_path = self.project_dir / "custom_listing.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "NSS--鼻部症状综合评分"
+        ws.append(["研究中心", "受试者", "访视OID", "访视名称", "评估日期", "NSS总分"])
+        ws.append(["示例中心医院", "S01001", "D1", "基线", "2026-01-02", 9])
+        ws.append(["示例中心医院", "S01001", "D15", "第15天", "2026-01-16", 4])
+        wb.save(listing_path)
+        summary = MODULE.detect_protocol_endpoint_summary([protocol_path])
+        configs = MODULE.detect_efficacy_config(listing_path, summary)
+        self.assertEqual(summary["selected_metrics"][0]["metric"], "NSS")
+        self.assertEqual(configs[0]["metric"], "NSS")
+        self.assertEqual(configs[0]["sheet"], "NSS--鼻部症状综合评分")
 
     def test_build_without_finding_hides_finding_ui(self) -> None:
         os.remove(self.project_dir / "demo_finding.xlsx")
